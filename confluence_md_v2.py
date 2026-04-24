@@ -1,73 +1,80 @@
 """
-confluence_md_v2.py - Confluence 차일드 페이지 수집 + LLM 분석 (개선판)
-
-개선사항:
-  1. html2text 로 문서 순서 유지한 정확한 MD 변환
-  2. 이미지 다운로드 → base64 → Vision LLM 으로 실제 내용 분석
-  3. 페이지별 LLM 요약 (단순 텍스트 자르기 X)
-  4. MD 파일 선택 → 보고서 생성 탭 추가
+Confluence 차일드 페이지 요약 GUI - v2
+원본 구조 유지 + LLM 요약 추가 (팀장 보고용)
 """
 
-import os, re, base64, threading, traceback
+# ── 패키지 자동 설치 ──────────────────────────
+import subprocess, sys
+
+def _install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+try:
+    import html2text
+except ImportError:
+    print("html2text 설치 중..."); _install("html2text"); import html2text
+
+try:
+    from openai import OpenAI
+    OPENAI_OK = True
+except ImportError:
+    print("openai 설치 중..."); _install("openai")
+    from openai import OpenAI
+    OPENAI_OK = True
+
+# ── 기본 임포트 ───────────────────────────────
+import os, re, threading, traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Dict, List, Optional
 from datetime import datetime
 from bs4 import BeautifulSoup
-import html2text
-from openai import OpenAI
 
 # ─────────────────────────────────────────────
-# 설정 (회사 환경에 맞게 수정)
+# 설정
 # ─────────────────────────────────────────────
-BASE_URL        = "https://confluence.sec.samsung.net"
-USER_DATA_DIR   = "./chrome_profile_confluence_md"
+BASE_URL      = "https://confluence.sec.samsung.net"
+USER_DATA_DIR = "./chrome_profile_confluence_md"
 
-LLM_API_KEY     = os.getenv("LLM_API_KEY", "YOUR_API_KEY")
-LLM_BASE_URL    = os.getenv("LLM_BASE_URL", "https://your-lucode-endpoint/v1")
-LLM_MODEL       = os.getenv("LLM_MODEL",    "gpt-4o")
-LLM_VISION_MODEL= os.getenv("LLM_VISION_MODEL", "gpt-4o")   # 이미지 분석용 (같아도 됨)
-LLM_MAX_TOKENS  = int(os.getenv("LLM_MAX_TOKENS", "2000"))
+LLM_API_KEY   = os.getenv("LLM_API_KEY",   "YOUR_API_KEY")
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL",  "https://your-endpoint/v1")
+LLM_MODEL     = os.getenv("LLM_MODEL",     "qwen-plus")
+LLM_MAX_TOKENS= int(os.getenv("LLM_MAX_TOKENS", "2000"))
 
 # ─────────────────────────────────────────────
-# LLM 클라이언트
+# LLM 요약 함수
 # ─────────────────────────────────────────────
-def _llm():
-    return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
-
-
-def llm_summarize_page(title: str, markdown_text: str) -> str:
-    """페이지 MD 내용을 LLM 으로 요약"""
+def llm_summarize_page(title: str, text: str) -> str:
+    """페이지 내용 → 팀장 보고용 요약"""
     try:
-        resp = _llm().chat.completions.create(
+        client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content":
                     "당신은 400명 규모 조직의 팀장을 위한 업무 보고서 작성 전문가입니다.\n\n"
-                    "【작성 원칙】\n"
-                    "1. 반드시 제공된 문서 내용만을 근거로 작성하세요. 추측하거나 내용을 창작하지 마세요.\n"
-                    "2. 팀장은 각 담당자의 전문 기술을 잘 모를 수 있습니다. "
-                    "   전문 용어가 나오면 괄호 안에 쉬운 말로 설명을 덧붙이세요.\n"
-                    "   예) 'API 연동(시스템끼리 데이터를 주고받는 연결 작업)'\n"
-                    "3. 격식 있는 문어체로 작성하세요. (~하였습니다, ~진행 중에 있습니다)\n"
-                    "4. 누가 읽어도 이해할 수 있도록 쉽고 구체적으로 풀어 쓰세요.\n"
-                    "5. 수치, 날짜, 완료 여부 등 구체적인 사실은 그대로 포함하세요.\n\n"
+                    "【절대 규칙】\n"
+                    "- 제공된 문서 내용만 사용하세요. 없는 내용은 절대 만들지 마세요.\n"
+                    "- 문서에 없는 항목은 '해당 내용이 문서에 명시되지 않았습니다.'라고 쓰세요.\n\n"
+                    "【작성 방식】\n"
+                    "- 팀장은 각 담당자의 전문 기술을 잘 모릅니다. "
+                    "전문 용어가 나오면 반드시 괄호로 쉽게 설명하세요.\n"
+                    "  예) API 연동(서로 다른 시스템이 데이터를 주고받는 연결 작업)\n"
+                    "- 격식체를 사용하세요. (~하였습니다, ~진행 중에 있습니다)\n"
+                    "- 수치, 날짜, 완료 여부는 문서 그대로 포함하세요.\n\n"
                     "【보고서 형식】\n"
                     "## 개요\n"
-                    "(이 업무가 무엇인지, 왜 하는지 2~3문장으로 쉽게 설명)\n\n"
-                    "## 이번 주 주요 내용\n"
-                    "(문서에 기록된 사실만, 불릿 포인트로)\n\n"
+                    "이 업무가 무엇인지, 왜 하는지 2~3문장으로 쉽게 설명\n\n"
+                    "## 이번 주요 내용\n"
+                    "문서에 기록된 사실만, 불릿 포인트로\n\n"
                     "## 완료된 사항\n"
-                    "(없으면 생략)\n\n"
+                    "없으면 생략\n\n"
                     "## 진행 중인 사항\n"
-                    "(없으면 생략)\n\n"
+                    "없으면 생략\n\n"
                     "## 이슈 및 특이사항\n"
-                    "(없으면 생략)\n\n"
-                    "내용이 부족하거나 불명확한 경우 '문서에 해당 내용이 명시되지 않았습니다.'라고 표기하세요."},
+                    "없으면 생략"},
                 {"role": "user", "content":
-                    f"아래 Confluence 페이지 내용을 바탕으로 팀장 보고용 요약을 작성해주세요.\n\n"
-                    f"페이지 제목: {title}\n\n"
-                    f"=== 문서 내용 ===\n{markdown_text[:5000]}"}
+                    f"페이지 제목: {title}\n\n=== 문서 내용 ===\n{text[:5000]}"}
             ],
             max_tokens=LLM_MAX_TOKENS,
             temperature=0.1,
@@ -77,72 +84,42 @@ def llm_summarize_page(title: str, markdown_text: str) -> str:
         return f"[LLM 요약 실패: {e}]"
 
 
-def llm_analyze_image(image_bytes: bytes, context: str = "") -> str:
-    """이미지 바이트를 Vision LLM 으로 분석"""
-    try:
-        b64 = base64.b64encode(image_bytes).decode()
-        messages = [
-            {"role": "system", "content":
-                "당신은 기업 문서의 이미지/차트/다이어그램을 분석하는 전문가입니다. "
-                "이미지에 담긴 핵심 정보를 한국어로 설명하세요. "
-                "수치, 추세, 상태(완료/진행/이슈) 를 중심으로 3~5문장으로 요약하세요."},
-            {"role": "user", "content": [
-                {"type": "text",
-                 "text": f"다음 Confluence 페이지 이미지를 분석해주세요.{(' 참고: ' + context) if context else ''}"},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}}
-            ]}
-        ]
-        resp = _llm().chat.completions.create(
-            model=LLM_VISION_MODEL,
-            messages=messages,
-            max_tokens=500,
-            temperature=0.3,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return f"[이미지 분석 실패: {e}]"
-
-
-def llm_generate_report(selected_md_contents: List[Dict]) -> str:
-    """여러 MD 파일을 종합해 보고서 생성"""
+def llm_generate_report(pages: list) -> str:
+    """선택된 MD 파일들 → 종합 보고서"""
     combined = ""
-    for item in selected_md_contents:
-        combined += f"\n\n### {item['title']}\n{item['content'][:2000]}"
-
+    for p in pages:
+        combined += f"\n\n### {p['title']}\n{p['content'][:2000]}"
     try:
-        resp = _llm().chat.completions.create(
+        client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content":
-                    "당신은 400명 규모 조직의 팀장을 위한 종합 업무 보고서 작성 전문가입니다.\n\n"
-                    "【작성 원칙】\n"
-                    "1. 제공된 각 페이지의 내용만을 근거로 작성하세요. 절대로 내용을 지어내거나 추측하지 마세요.\n"
-                    "2. 팀장은 각 팀원의 전문 업무를 모두 알지 못합니다. "
-                    "   전문 용어는 반드시 쉬운 말로 풀어 설명하세요.\n"
-                    "   예) 'CI/CD 파이프라인(코드 수정 시 자동으로 테스트하고 배포하는 시스템)'\n"
-                    "3. 격식 있는 문어체를 사용하세요. (~하였습니다, ~검토 중에 있습니다)\n"
-                    "4. 각 팀/담당자별로 무엇을 하는지 모르는 사람도 이해할 수 있게 구체적으로 설명하세요.\n"
-                    "5. 수치, 날짜, 완료율 등 구체적인 정보는 그대로 포함하세요.\n"
-                    "6. 문서에 없는 내용은 절대 추가하지 마세요.\n\n"
+                    "당신은 400명 규모 조직의 팀장을 위한 종합 보고서 작성 전문가입니다.\n\n"
+                    "【절대 규칙】\n"
+                    "- 제공된 내용만 사용. 없는 내용은 절대 만들지 마세요.\n"
+                    "- 추측이나 창작 금지. 불확실한 내용은 '문서에 명시되지 않음'으로 표기.\n\n"
+                    "【작성 방식】\n"
+                    "- 각 팀/담당자가 무슨 일을 하는지 처음 보는 사람도 이해하도록 구체적으로 설명\n"
+                    "- 전문 용어는 괄호로 쉬운 말 추가 (예: CI/CD(코드 변경 시 자동 테스트·배포 시스템))\n"
+                    "- 격식 있는 문어체 사용 (~하였습니다, ~검토 중에 있습니다)\n"
+                    "- 수치, 날짜, 완료율 등 구체적 수치는 반드시 포함\n\n"
                     "【보고서 구성】\n"
                     "# 1. 전체 요약\n"
-                    "(전체 내용을 처음 보는 사람도 이해할 수 있게 3~5문장으로 요약)\n\n"
+                    "처음 보는 사람도 이해할 수 있게 3~5문장\n\n"
                     "# 2. 항목별 상세 현황\n"
-                    "(각 페이지/팀별로, 업무 내용 + 현재 상태를 쉽게 풀어서)\n\n"
+                    "각 페이지/팀별 업무 내용과 현재 상태\n\n"
                     "# 3. 완료된 주요 사항\n"
-                    "(이번 기간 내 완료된 것들, 없으면 생략)\n\n"
+                    "없으면 생략\n\n"
                     "# 4. 진행 중인 주요 과제\n"
-                    "(현재 진행 중인 것들과 예상 완료 시점)\n\n"
+                    "없으면 생략\n\n"
                     "# 5. 이슈 및 리스크\n"
-                    "(문제가 되거나 주의가 필요한 사항, 없으면 생략)\n\n"
-                    "# 6. 조치 필요 사항\n"
-                    "(팀장이 결정하거나 확인해야 할 사항, 없으면 생략)\n\n"
-                    "한국어 격식체로 작성. 문서에 없는 내용은 절대 추가하지 않음."},
+                    "없으면 생략\n\n"
+                    "# 6. 팀장 조치 필요 사항\n"
+                    "없으면 생략"},
                 {"role": "user", "content":
-                    f"아래 {len(selected_md_contents)}개 페이지의 내용을 바탕으로 팀장 보고용 종합 보고서를 작성해주세요.\n"
-                    f"반드시 아래 제공된 내용만 사용하고, 없는 내용은 만들지 마세요.\n\n"
-                    f"=== 각 페이지 내용 ===\n{combined}"}
+                    f"{len(pages)}개 페이지 내용으로 팀장 보고용 종합 보고서를 작성해주세요.\n"
+                    f"제공된 내용만 사용하세요.\n\n=== 내용 ===\n{combined}"}
             ],
             max_tokens=LLM_MAX_TOKENS * 2,
             temperature=0.1,
@@ -153,63 +130,7 @@ def llm_generate_report(selected_md_contents: List[Dict]) -> str:
 
 
 # ─────────────────────────────────────────────
-# HTML → Markdown 변환 (문서 순서 보존)
-# ─────────────────────────────────────────────
-def html_to_markdown(html: str, page_session=None, base_url: str = "") -> str:
-    """
-    html2text 로 문서 순서를 유지한 MD 변환.
-    이미지는 Playwright 세션으로 다운로드 후 Vision LLM 분석.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # ── 이미지 처리 (Vision LLM) ──────────────────
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        alt = img.get("alt", "이미지")
-
-        if not src:
-            continue
-
-        img_desc = None
-
-        if page_session and src:
-            try:
-                full_src = src if src.startswith("http") else base_url + src
-                # Playwright 세션으로 인증 포함 다운로드
-                resp = page_session.request.get(full_src)
-                if resp.status == 200:
-                    img_bytes = resp.body()
-                    if len(img_bytes) > 1000:   # 너무 작은 아이콘은 스킵
-                        img_desc = llm_analyze_image(img_bytes, context=alt)
-            except Exception as e:
-                img_desc = f"[이미지 다운로드 실패: {e}]"
-
-        # 이미지를 설명 블록으로 교체
-        if img_desc:
-            replacement = soup.new_tag("p")
-            replacement.string = f"📸 **[이미지 분석: {alt}]** {img_desc}"
-            img.replace_with(replacement)
-        else:
-            replacement = soup.new_tag("p")
-            replacement.string = f"📸 **[이미지: {alt}]** (분석 불가 - src: {src[:80]})"
-            img.replace_with(replacement)
-
-    # ── html2text 설정 ────────────────────────────
-    h = html2text.HTML2Text()
-    h.ignore_links      = False
-    h.ignore_images     = True   # 이미 위에서 처리함
-    h.body_width        = 0      # 줄바꿈 없음
-    h.protect_links     = True
-    h.wrap_links        = False
-    h.unicode_snob      = True
-    h.ignore_emphasis   = False
-    h.mark_code         = True
-
-    return h.handle(str(soup))
-
-
-# ─────────────────────────────────────────────
-# Confluence API
+# 유틸
 # ─────────────────────────────────────────────
 def clean_filename(title: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", title).strip()
@@ -217,203 +138,293 @@ def clean_filename(title: str) -> str:
 def extract_page_id_from_url(url: str) -> Optional[str]:
     m = re.search(r'/pages/(\d+)', url)
     if m: return m.group(1)
-    m = re.search(r'pageId=(\d+)', url)
+    m = re.search(r'pages/(\d{8,})', url)
     if m: return m.group(1)
     return None
 
-def get_page_content(page_session, page_id: str) -> Optional[Dict]:
-    try:
-        resp = page_session.request.get(
-            f"{BASE_URL}/rest/api/content/{page_id}",
-            params={"expand": "body.storage"}
-        )
-        if resp.status != 200:
-            return None
-        d = resp.json()
-        return {
-            "id":    d.get("id"),
-            "title": d.get("title", ""),
-            "html":  d.get("body", {}).get("storage", {}).get("value", "")
-        }
-    except:
-        return None
+def extract_image_info(html_content: str) -> List[Dict]:
+    images = []
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for img in soup.find_all('img'):
+        images.append({
+            'src':   img.get('src', ''),
+            'alt':   img.get('alt', ''),
+            'title': img.get('title', ''),
+        })
+    return images
 
-def get_children(page_session, parent_id: str) -> List[Dict]:
-    pages, start = [], 0
+def analyze_confluence_content(html_content: str) -> Dict:
+    soup = BeautifulSoup(html_content, 'html.parser')
+    text_content = []
+    for i in range(1, 7):
+        for h in soup.find_all(f'h{i}'):
+            text_content.append({'type': f'heading_{i}', 'content': h.get_text(strip=True)})
+    for table in soup.find_all('table'):
+        headers = [th.get_text(strip=True) for th in table.find_all('th')]
+        rows = []
+        for tr in table.find_all('tr'):
+            row = [td.get_text(strip=True) for td in tr.find_all('td')]
+            if row: rows.append(row)
+        if headers or rows:
+            text_content.append({'type': 'table', 'headers': headers, 'rows': rows})
+    for ul in soup.find_all(['ul', 'ol']):
+        items = [li.get_text(strip=True) for li in ul.find_all('li', recursive=False)]
+        if items: text_content.append({'type': 'list', 'items': items})
+    for p in soup.find_all('p'):
+        t = p.get_text(strip=True)
+        if t and len(t) > 10:
+            text_content.append({'type': 'paragraph', 'content': t})
+    return {'text_content': text_content, 'images': extract_image_info(html_content)}
+
+def convert_to_markdown(analysis: Dict, title: str) -> str:
+    md = [f"# {title}", "", "---",
+          f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "---", ""]
+    if analysis['images']:
+        md += ["## 이미지", ""]
+        for i, img in enumerate(analysis['images'], 1):
+            md.append(f"{i}. **{img.get('alt','이미지')}**: {img.get('src','')}")
+        md.append("")
+    md += ["## 내용", ""]
+    for item in analysis['text_content']:
+        t = item['type']
+        if t.startswith('heading_'):
+            md.append(f"{'#' * int(t[-1])} {item['content']}")
+            md.append("")
+        elif t == 'table':
+            h = item.get('headers', [])
+            if h:
+                md.append("| " + " | ".join(h) + " |")
+                md.append("| " + " | ".join(["---"] * len(h)) + " |")
+                for row in item.get('rows', []):
+                    while len(row) < len(h): row.append("")
+                    md.append("| " + " | ".join(row) + " |")
+                md.append("")
+        elif t == 'list':
+            for it in item.get('items', []): md.append(f"- {it}")
+            md.append("")
+        elif t == 'paragraph':
+            md.append(item['content'])
+            md.append("")
+    return "\n".join(md)
+
+def get_page_children(page, parent_id: str) -> List[Dict]:
+    all_pages, start = [], 0
     while True:
-        resp = page_session.request.get(
+        resp = page.request.get(
             f"{BASE_URL}/rest/api/content/search",
             params={"cql": f"ancestor={parent_id} and type=page",
                     "start": str(start), "limit": "50", "expand": "version"}
         )
         if resp.status != 200: break
-        data    = resp.json()
+        data = resp.json()
         results = data.get("results", [])
         if not results: break
         for doc in results:
-            pages.append({"id": doc["id"], "title": doc["title"]})
-        if len(pages) >= data.get("size", 0): break
+            all_pages.append({"id": doc["id"], "title": doc["title"],
+                               "url": doc.get("_links", {}).get("webui", "")})
+        if len(all_pages) >= data.get("size", 0): break
         start += 50
         if start > 500: break
-    return pages
+    return all_pages
 
+def get_page_content(page, page_id: str) -> Optional[Dict]:
+    try:
+        resp = page.request.get(
+            f"{BASE_URL}/rest/api/content/{page_id}",
+            params={"expand": "body.storage"}
+        )
+        if resp.status != 200: return None
+        d = resp.json()
+        html = d.get("body", {}).get("storage", {}).get("value", "")
+        if not html: return None
+        return {"id": d.get("id"), "title": d.get("title"), "html": html}
+    except:
+        return None
 
-# ─────────────────────────────────────────────
-# 페이지 처리 (재귀)
-# ─────────────────────────────────────────────
-def process_page(page_session, page_id: str, save_dir: str,
-                 depth: int, use_vision: bool, use_llm_summary: bool,
-                 callback=None):
+def process_child_pages_recursive(page, page_id: str, save_dir: str,
+                                   depth: int = 2, use_llm: bool = True,
+                                   callback=None):
+    if callback: callback(f"페이지 {page_id} 처리 중...")
+    try:
+        data = get_page_content(page, page_id)
+        if not data:
+            if callback: callback(f"  [실패] {page_id}")
+            return
+        analysis = analyze_confluence_content(data['html'])
+        markdown  = convert_to_markdown(analysis, data['title'])
 
-    def log(msg):
-        if callback: callback(msg)
+        # LLM 요약 추가
+        llm_block = ""
+        if use_llm and LLM_API_KEY != "YOUR_API_KEY":
+            if callback: callback(f"    LLM 요약 중: {data['title']}")
+            summary  = llm_summarize_page(data['title'], markdown)
+            llm_block = f"\n\n---\n## 🤖 AI 요약 (팀장 보고용)\n\n{summary}\n\n---\n"
 
-    data = get_page_content(page_session, page_id)
-    if not data:
-        log(f"  [실패] 페이지 가져오기 실패: {page_id}")
-        return
+        safe = clean_filename(data['title'])
+        path = os.path.join(save_dir, f"{page_id}_{safe}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(markdown + llm_block)
+        if callback: callback(f"  [완료] {data['title']} → {path}")
 
-    title = data["title"]
-    log(f"  처리 중: {title}")
-
-    # HTML → MD
-    ps = page_session if use_vision else None
-    md_body = html_to_markdown(data["html"], page_session=ps, base_url=BASE_URL)
-
-    # LLM 요약
-    llm_summary = ""
-    if use_llm_summary:
-        log(f"    LLM 요약 중: {title}")
-        llm_summary = llm_summarize_page(title, md_body)
-
-    # 파일 저장
-    md_lines = [
-        f"# {title}", "",
-        f"---",
-        f"페이지 ID: {page_id}",
-        f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"---", "",
-    ]
-    if llm_summary:
-        md_lines += ["## 🤖 AI 요약", "", llm_summary, "", "---", ""]
-    md_lines += ["## 원문 내용", "", md_body]
-
-    safe = clean_filename(title)
-    path = os.path.join(save_dir, f"{page_id}_{safe}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines))
-    log(f"  [저장] {path}")
-
-    # 자식 페이지 재귀
-    if depth > 0:
-        children = get_children(page_session, page_id)
-        if children:
-            child_dir = os.path.join(save_dir, f"sub_{safe}")
+        children = get_page_children(page, page_id)
+        if children and depth > 0:
+            child_dir = os.path.join(save_dir, f"children_{page_id}")
             os.makedirs(child_dir, exist_ok=True)
             for child in children:
-                process_page(page_session, child["id"], child_dir,
-                             depth - 1, use_vision, use_llm_summary, callback)
+                process_child_pages_recursive(page, child['id'], child_dir,
+                                               depth - 1, use_llm, callback)
+    except Exception as e:
+        if callback: callback(f"[오류] {e}\n{traceback.format_exc()}")
+
+def generate_summary_report(page, page_id: str, save_dir: str,
+                             max_depth: int = 2, use_llm: bool = True,
+                             callback=None) -> str:
+    lines = ["# 차일드 페이지 요약 보고서", "",
+             f"생성일: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+             f"최대 깊이: {max_depth}", "", "=" * 80, ""]
+
+    page_data = get_page_content(page, page_id)
+    if page_data:
+        lines.append(f"📁 선택 페이지: {page_data['title']} (ID: {page_id})")
+        lines.append("")
+
+    def collect(pid, depth=0):
+        result = []
+        children = get_page_children(page, pid)
+        for child in children:
+            cd = get_page_content(page, child['id'])
+            if cd:
+                analysis = analyze_confluence_content(cd['html'])
+                md_text  = convert_to_markdown(analysis, cd['title'])
+                result.append({"id": child['id'], "title": cd['title'],
+                                "depth": depth + 1, "analysis": analysis,
+                                "md_text": md_text})
+                if depth + 1 < max_depth:
+                    result.extend(collect(child['id'], depth + 1))
+        return result
+
+    all_pages = collect(page_id)
+
+    if not all_pages:
+        lines.append("차일드 페이지가 없습니다.")
+    else:
+        # LLM 종합 보고서
+        if use_llm and LLM_API_KEY != "YOUR_API_KEY":
+            if callback: callback("LLM 종합 보고서 생성 중...")
+            report = llm_generate_report([
+                {"title": p["title"], "content": p["md_text"]} for p in all_pages
+            ])
+            lines += ["## 🤖 AI 종합 보고서 (팀장 보고용)", "", report, "", "=" * 80, ""]
+
+        # 목차
+        lines += ["## 페이지 목록", ""]
+        for p in all_pages:
+            indent = "  " * (p['depth'] - 1)
+            lines.append(f"{indent}📄 {p['title']} (ID: {p['id']})")
+            a = p['analysis']
+            for item in a['text_content'][:3]:
+                t = item['type']
+                if t.startswith('heading_'):
+                    lines.append(f"{indent}   {'#'*int(t[-1])} {item['content'][:80]}")
+                elif t == 'paragraph':
+                    lines.append(f"{indent}   {item['content'][:100]}...")
+            if a['images']:
+                lines.append(f"{indent}   🖼️ 이미지 {len(a['images'])}개")
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
-# GUI
+# GUI (원본 구조 유지)
 # ─────────────────────────────────────────────
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Confluence MD 수집 + 보고서 생성 v2")
-        self.geometry("900x700")
-        self.resizable(True, True)
+class ConfluenceChildSummaryGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Confluence 차일드 페이지 요약 v2")
+        self.root.geometry("800x650")
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.url_var    = tk.StringVar()
+        self.depth_var  = tk.IntVar(value=7)
+        self.out_var    = tk.StringVar(value="./confluence_output")
+        self.llm_var    = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="준비됨")
+        self.create_widgets()
 
-        self.tab_crawl  = CrawlTab(nb)
-        self.tab_report = ReportTab(nb)
+    def create_widgets(self):
+        f = ttk.Frame(self.root, padding="10")
+        f.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        nb.add(self.tab_crawl,  text="📥 수집")
-        nb.add(self.tab_report, text="📊 보고서 생성")
+        ttk.Label(f, text="Confluence URL:").grid(row=0, column=0, sticky="w", pady=5)
+        self.url_entry = ttk.Entry(f, textvariable=self.url_var, width=70)
+        self.url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        self.url_entry.insert(0, "https://confluence.sec.samsung.net/pages/...")
 
+        self.pid_lbl = ttk.Label(f, text="페이지 ID: ", foreground="gray")
+        self.pid_lbl.grid(row=1, column=1, sticky="w")
 
-# ── 수집 탭 ──────────────────────────────────
-class CrawlTab(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent, padding=10)
-        self._build()
+        ttk.Label(f, text="재귀 깊이:").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Spinbox(f, from_=0, to=15, textvariable=self.depth_var, width=10).grid(row=2, column=1, sticky="w")
 
-    def _build(self):
-        # URL
-        ttk.Label(self, text="Confluence URL:").grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.url_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self.url_var, width=65).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=4)
-        self.url_var.trace_add("write", self._on_url)
+        ttk.Checkbutton(f, text="🤖 LLM 요약 생성 (팀장 보고용)", variable=self.llm_var).grid(
+            row=3, column=1, sticky="w", pady=3)
 
-        self.pid_lbl = ttk.Label(self, text="페이지 ID: —", foreground="gray")
-        self.pid_lbl.grid(row=1, column=1, sticky=tk.W)
+        ttk.Label(f, text="출력 폴더:").grid(row=4, column=0, sticky="w", pady=5)
+        frm = ttk.Frame(f)
+        frm.grid(row=4, column=1, columnspan=2, sticky="ew")
+        ttk.Entry(frm, textvariable=self.out_var, width=50).pack(side="left")
+        ttk.Button(frm, text="찾아보기", command=self.browse).pack(side="left", padx=5)
 
-        # 깊이
-        ttk.Label(self, text="재귀 깊이:").grid(row=2, column=0, sticky=tk.W, pady=4)
-        self.depth_var = tk.IntVar(value=3)
-        ttk.Spinbox(self, from_=0, to=10, textvariable=self.depth_var, width=8).grid(row=2, column=1, sticky=tk.W)
+        self.run_btn = ttk.Button(f, text="▶ 실행", command=self.run)
+        self.run_btn.grid(row=5, column=0, pady=10)
 
-        # 옵션
-        self.vision_var  = tk.BooleanVar(value=True)
-        self.summary_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self, text="이미지 Vision AI 분석", variable=self.vision_var).grid(row=3, column=1, sticky=tk.W)
-        ttk.Checkbutton(self, text="페이지별 LLM 요약 생성", variable=self.summary_var).grid(row=4, column=1, sticky=tk.W)
+        self.progress = ttk.Progressbar(f, mode='indeterminate', length=650)
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew")
 
-        # 출력 폴더
-        ttk.Label(self, text="출력 폴더:").grid(row=5, column=0, sticky=tk.W, pady=4)
-        self.out_var = tk.StringVar(value="./confluence_output")
-        frm = ttk.Frame(self)
-        frm.grid(row=5, column=1, columnspan=2, sticky=tk.EW)
-        ttk.Entry(frm, textvariable=self.out_var, width=50).pack(side=tk.LEFT)
-        ttk.Button(frm, text="찾아보기", command=self._browse).pack(side=tk.LEFT, padx=4)
-
-        # 실행
-        self.btn = ttk.Button(self, text="▶ 수집 시작", command=self._run)
-        self.btn.grid(row=6, column=0, pady=8)
-
-        self.prog = ttk.Progressbar(self, mode="indeterminate", length=700)
-        self.prog.grid(row=7, column=0, columnspan=3, sticky=tk.EW)
-
-        # 로그
-        ttk.Label(self, text="로그:").grid(row=8, column=0, sticky=tk.W)
-        lf = ttk.Frame(self)
-        lf.grid(row=9, column=0, columnspan=3, sticky=tk.NSEW)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(9, weight=1)
+        ttk.Label(f, text="로그:").grid(row=7, column=0, sticky="w")
+        lf = ttk.Frame(f)
+        lf.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        f.rowconfigure(8, weight=1)
+        f.columnconfigure(1, weight=1)
         sb = ttk.Scrollbar(lf)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_box = tk.Text(lf, height=16, yscrollcommand=sb.set, wrap=tk.WORD)
-        self.log_box.pack(fill=tk.BOTH, expand=True)
+        sb.pack(side="right", fill="y")
+        self.log_box = tk.Text(lf, height=16, yscrollcommand=sb.set)
+        self.log_box.pack(fill="both", expand=True)
         sb.config(command=self.log_box.yview)
 
-    def _on_url(self, *_):
+        ttk.Label(f, textvariable=self.status_var, foreground="blue").grid(
+            row=9, column=0, columnspan=3, pady=5)
+
+        self.url_var.trace_add("write", self.on_url)
+
+    def on_url(self, *_):
         pid = extract_page_id_from_url(self.url_var.get())
         if pid:
             self.pid_lbl.config(text=f"페이지 ID: {pid}", foreground="green")
         else:
-            self.pid_lbl.config(text="페이지 ID: 찾을 수 없음", foreground="red")
+            self.pid_lbl.config(text="페이지 ID: (찾을 수 없음)", foreground="red")
 
-    def _browse(self):
+    def browse(self):
         d = filedialog.askdirectory()
         if d: self.out_var.set(d)
 
     def log(self, msg):
         try:
-            self.log_box.insert(tk.END, msg + "\n")
-            self.log_box.see(tk.END)
-            self.update_idletasks()
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+            self.root.update_idletasks()
         except: pass
 
-    def _run(self):
+    def run(self):
         pid = extract_page_id_from_url(self.url_var.get())
         if not pid:
             messagebox.showerror("오류", "URL에서 페이지 ID를 찾을 수 없습니다.")
             return
-        self.btn.config(state="disabled")
-        self.prog.start()
+        self.run_btn.config(state="disabled")
+        self.progress.start()
+        self.status_var.set("실행 중...")
         threading.Thread(target=self._worker, args=(pid,), daemon=True).start()
 
     def _worker(self, page_id):
@@ -423,104 +434,60 @@ class CrawlTab(ttk.Frame):
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch_persistent_context(
-                    user_data_dir=USER_DATA_DIR,
-                    headless=False,
+                    user_data_dir=USER_DATA_DIR, headless=False,
                     viewport={"width": 1280, "height": 720},
                 )
                 page = browser.new_page()
                 page.goto(f"{BASE_URL}/pages/viewpage.action?pageId={page_id}")
-                page.wait_for_load_state("networkidle", timeout=30000)
+                try: page.wait_for_load_state("networkidle", timeout=30000)
+                except: pass
 
                 if not messagebox.askokcancel("로그인 확인",
-                        "Confluence에 로그인되어 있나요?\n[확인] 진행 / [취소] 중단"):
-                    browser.close()
-                    return
+                        "Confluence에 로그인되어 있나요?\n[확인] 진행  [취소] 중단"):
+                    browser.close(); return
 
                 page.reload(wait_until="networkidle")
                 self.log("=" * 50)
                 self.log(f"수집 시작 | 페이지 ID: {page_id}")
-                self.log(f"Vision AI: {self.vision_var.get()} | LLM 요약: {self.summary_var.get()}")
+                self.log(f"LLM 요약: {'켜짐' if self.llm_var.get() else '꺼짐'}")
                 self.log("=" * 50)
 
-                process_page(
-                    page_session  = page,
-                    page_id       = page_id,
-                    save_dir      = save_dir,
-                    depth         = self.depth_var.get(),
-                    use_vision    = self.vision_var.get(),
-                    use_llm_summary = self.summary_var.get(),
-                    callback      = self.log,
+                process_child_pages_recursive(
+                    page, page_id, save_dir,
+                    depth=self.depth_var.get(),
+                    use_llm=self.llm_var.get(),
+                    callback=self.log,
                 )
+
+                self.log("\n요약 보고서 생성 중...")
+                summary = generate_summary_report(
+                    page, page_id, save_dir,
+                    max_depth=self.depth_var.get(),
+                    use_llm=self.llm_var.get(),
+                    callback=self.log,
+                )
+                rpt_path = os.path.join(save_dir, f"{page_id}_요약보고서.md")
+                with open(rpt_path, "w", encoding="utf-8") as f:
+                    f.write(summary)
+                self.log(f"보고서 저장: {rpt_path}")
+
                 browser.close()
-                self.log("\n✅ 수집 완료!")
-                self.log(f"저장 위치: {os.path.abspath(save_dir)}")
-                messagebox.showinfo("완료", f"수집 완료!\n{os.path.abspath(save_dir)}")
+                self.log("\n✅ 완료!")
+                self.status_var.set("완료")
+                messagebox.showinfo("완료", f"완료!\n저장 위치: {os.path.abspath(save_dir)}")
         except Exception as e:
             self.log(f"[오류] {e}\n{traceback.format_exc()}")
+            self.status_var.set("오류")
             messagebox.showerror("오류", str(e))
         finally:
-            self.after(0, lambda: (self.prog.stop(), self.btn.config(state="normal")))
+            self.root.after(0, lambda: (self.progress.stop(),
+                                        self.run_btn.config(state="normal")))
 
 
-# ── 보고서 생성 탭 ────────────────────────────
-class ReportTab(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent, padding=10)
-        self.md_files: List[str] = []
-        self._build()
+def main():
+    root = tk.Tk()
+    ConfluenceChildSummaryGUI(root)
+    root.mainloop()
 
-    def _build(self):
-        ttk.Label(self, text="MD 파일 선택 (여러 개 가능):").grid(row=0, column=0, sticky=tk.W, pady=4)
-
-        btn_frm = ttk.Frame(self)
-        btn_frm.grid(row=0, column=1, sticky=tk.W, pady=4)
-        ttk.Button(btn_frm, text="📂 폴더에서 MD 불러오기", command=self._load_folder).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frm, text="📄 파일 직접 선택",         command=self._load_files).pack(side=tk.LEFT)
-
-        # 파일 목록
-        lf = ttk.LabelFrame(self, text="선택된 파일 목록")
-        lf.grid(row=1, column=0, columnspan=2, sticky=tk.NSEW, pady=6)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
-
-        sb = ttk.Scrollbar(lf)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_list = tk.Listbox(lf, selectmode=tk.EXTENDED, height=10,
-                                    yscrollcommand=sb.set)
-        self.file_list.pack(fill=tk.BOTH, expand=True)
-        sb.config(command=self.file_list.yview)
-        ttk.Button(lf, text="선택 항목 제거", command=self._remove_selected).pack(anchor=tk.E, padx=4, pady=2)
-
-        # 보고서 옵션
-        opt_frm = ttk.LabelFrame(self, text="보고서 옵션")
-        opt_frm.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=6)
-        self.report_title_var = tk.StringVar(value="주간 보고서")
-        ttk.Label(opt_frm, text="보고서 제목:").grid(row=0, column=0, padx=6, pady=4, sticky=tk.W)
-        ttk.Entry(opt_frm, textvariable=self.report_title_var, width=40).grid(row=0, column=1, sticky=tk.W)
-
-        self.out_var = tk.StringVar(value="./reports")
-        ttk.Label(opt_frm, text="저장 폴더:").grid(row=1, column=0, padx=6, pady=4, sticky=tk.W)
-        frm2 = ttk.Frame(opt_frm)
-        frm2.grid(row=1, column=1, sticky=tk.W)
-        ttk.Entry(frm2, textvariable=self.out_var, width=40).pack(side=tk.LEFT)
-        ttk.Button(frm2, text="찾아보기",
-                   command=lambda: self.out_var.set(filedialog.askdirectory() or self.out_var.get())
-                   ).pack(side=tk.LEFT, padx=4)
-
-        # 실행
-        self.btn = ttk.Button(self, text="📊 보고서 생성 (LLM)", command=self._generate)
-        self.btn.grid(row=3, column=0, pady=8)
-
-        self.prog = ttk.Progressbar(self, mode="indeterminate", length=700)
-        self.prog.grid(row=4, column=0, columnspan=2, sticky=tk.EW)
-
-        # 로그
-        ttk.Label(self, text="로그:").grid(row=5, column=0, sticky=tk.W)
-        lf2 = ttk.Frame(self)
-        lf2.grid(row=6, column=0, columnspan=2, sticky=tk.NSEW, pady=4)
-        self.rowconfigure(6, weight=1)
-        sb2 = ttk.Scrollbar(lf2)
-        sb2.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_box = tk.Text(lf2, height=10, yscrollcommand=sb2.set, wrap=tk.WORD)
-        self.log_box.pack(fill=tk.BOTH, expand=True)
-      
+if __name__ == "__main__":
+    main()
