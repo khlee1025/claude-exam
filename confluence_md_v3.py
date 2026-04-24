@@ -34,13 +34,45 @@ from bs4 import BeautifulSoup
 BASE_URL      = "https://confluence.sec.samsung.net"
 USER_DATA_DIR = "./chrome_profile_confluence_md"
 
-LLM_API_KEY   = os.getenv("LLM_API_KEY",   "YOUR_API_KEY")
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL",  "https://your-endpoint/v1")
+LLM_API_KEY   = os.getenv("LLM_API_KEY",   "")
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL",  "")
 LLM_MODEL     = os.getenv("LLM_MODEL",     "qwen-plus")
 LLM_MAX_TOKENS= int(os.getenv("LLM_MAX_TOKENS", "2000"))
 
+# 설정 파일 (스크립트 폴더 옆에 저장)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_config.json")
+
+def load_llm_config():
+    """llm_config.json 에서 설정 불러오기"""
+    global LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS
+    if os.path.exists(CONFIG_FILE):
+        try:
+            import json
+            cfg = json.loads(open(CONFIG_FILE, encoding="utf-8").read())
+            LLM_API_KEY    = cfg.get("api_key",    LLM_API_KEY)
+            LLM_BASE_URL   = cfg.get("base_url",   LLM_BASE_URL)
+            LLM_MODEL      = cfg.get("model",      LLM_MODEL)
+            LLM_MAX_TOKENS = int(cfg.get("max_tokens", LLM_MAX_TOKENS))
+        except Exception as e:
+            print(f"[설정 불러오기 실패] {e}")
+
+def save_llm_config(api_key, base_url, model, max_tokens):
+    """llm_config.json 에 설정 저장"""
+    global LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_MAX_TOKENS
+    import json
+    LLM_API_KEY    = api_key
+    LLM_BASE_URL   = base_url
+    LLM_MODEL      = model
+    LLM_MAX_TOKENS = int(max_tokens)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"api_key": api_key, "base_url": base_url,
+                   "model": model, "max_tokens": max_tokens}, f, ensure_ascii=False, indent=2)
+
+# 시작 시 저장된 설정 불러오기
+load_llm_config()
+
 def _llm_ready():
-    return LLM_API_KEY not in ("", "YOUR_API_KEY")
+    return LLM_API_KEY not in ("", "YOUR_API_KEY") and LLM_BASE_URL not in ("", "https://your-endpoint/v1")
 
 # ─────────────────────────────────────────────
 # LLM 함수
@@ -346,11 +378,17 @@ class ConfluenceChildSummaryGUI:
         self.root.title("Confluence 차일드 페이지 요약 v3")
         self.root.geometry("820x680")
 
-        self.url_var   = tk.StringVar()
-        self.depth_var = tk.IntVar(value=7)
-        self.out_var   = tk.StringVar(value="./confluence_output")
-        self.llm_var   = tk.BooleanVar(value=True)
-        self.status_var= tk.StringVar(value="준비됨")
+        self.url_var    = tk.StringVar()
+        self.depth_var  = tk.IntVar(value=7)
+        self.out_var    = tk.StringVar(value="./confluence_output")
+        self.llm_var    = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="준비됨")
+
+        # LLM 설정 변수 (저장된 값으로 초기화)
+        self.llm_key_var    = tk.StringVar(value=LLM_API_KEY)
+        self.llm_url_var    = tk.StringVar(value=LLM_BASE_URL)
+        self.llm_model_var  = tk.StringVar(value=LLM_MODEL)
+        self.llm_tokens_var = tk.StringVar(value=str(LLM_MAX_TOKENS))
 
         self._build()
 
@@ -360,11 +398,14 @@ class ConfluenceChildSummaryGUI:
 
         tab1 = ttk.Frame(nb, padding=10)
         tab2 = ttk.Frame(nb, padding=10)
+        tab3 = ttk.Frame(nb, padding=10)
         nb.add(tab1, text="📥 수집")
         nb.add(tab2, text="📊 보고서 생성")
+        nb.add(tab3, text="⚙️ LLM 설정")
 
         self._build_crawl_tab(tab1)
         self._build_report_tab(tab2)
+        self._build_settings_tab(tab3)
 
     # ── 수집 탭 ──────────────────────────────
     def _build_crawl_tab(self, f):
@@ -438,6 +479,92 @@ class ConfluenceChildSummaryGUI:
         self.rpt_log = tk.Text(lf, height=16, yscrollcommand=sb.set)
         self.rpt_log.pack(fill="both", expand=True)
         sb.config(command=self.rpt_log.yview)
+
+    # ── LLM 설정 탭 ─────────────────────────
+    def _build_settings_tab(self, f):
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="루코드 LLM 연결 설정", font=("", 11, "bold")).grid(
+            row=0, column=0, columnspan=2, pady=(0, 12), sticky="w")
+
+        ttk.Label(f, text="API Key:").grid(row=1, column=0, sticky="w", pady=6)
+        key_frm = ttk.Frame(f)
+        key_frm.grid(row=1, column=1, sticky="ew", pady=6)
+        self.key_entry = ttk.Entry(key_frm, textvariable=self.llm_key_var, width=55, show="*")
+        self.key_entry.pack(side="left", fill="x", expand=True)
+        self._show_key = False
+        def toggle_key():
+            self._show_key = not self._show_key
+            self.key_entry.config(show="" if self._show_key else "*")
+            show_btn.config(text="숨기기" if self._show_key else "보기")
+        show_btn = ttk.Button(key_frm, text="보기", width=5, command=toggle_key)
+        show_btn.pack(side="left", padx=4)
+
+        ttk.Label(f, text="Base URL:").grid(row=2, column=0, sticky="w", pady=6)
+        url_entry = ttk.Entry(f, textvariable=self.llm_url_var, width=62)
+        url_entry.grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(f, text="  예) http://localhost:8000/v1  또는  https://루코드주소/v1",
+                  foreground="gray").grid(row=3, column=1, sticky="w")
+
+        ttk.Label(f, text="모델명:").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Entry(f, textvariable=self.llm_model_var, width=30).grid(row=4, column=1, sticky="w", pady=6)
+        ttk.Label(f, text="  예) qwen-plus  /  qwen2.5-72b-instruct",
+                  foreground="gray").grid(row=5, column=1, sticky="w")
+
+        ttk.Label(f, text="최대 토큰:").grid(row=6, column=0, sticky="w", pady=6)
+        ttk.Entry(f, textvariable=self.llm_tokens_var, width=10).grid(row=6, column=1, sticky="w", pady=6)
+
+        btn_frm = ttk.Frame(f)
+        btn_frm.grid(row=7, column=0, columnspan=2, pady=14, sticky="w")
+        ttk.Button(btn_frm, text="💾 설정 저장", command=self._save_settings).pack(side="left", padx=5)
+        ttk.Button(btn_frm, text="🔗 연결 테스트", command=self._test_llm).pack(side="left", padx=5)
+
+        self.settings_status = ttk.Label(f, text="", foreground="gray")
+        self.settings_status.grid(row=8, column=0, columnspan=2, sticky="w", pady=4)
+
+        ttk.Separator(f, orient="horizontal").grid(row=9, column=0, columnspan=2, sticky="ew", pady=10)
+        info = ("📌 설정 방법\n"
+                "1. 루코드 서버 주소를 Base URL에 입력하세요.\n"
+                "2. API Key는 루코드에서 발급받은 키를 입력하세요.\n"
+                "3. 모델명은 루코드 서버에서 제공하는 Qwen 모델명으로 입력하세요.\n"
+                "4. '설정 저장' 버튼을 누르면 다음에 실행해도 자동으로 불러옵니다.")
+        ttk.Label(f, text=info, foreground="#555", justify="left").grid(
+            row=10, column=0, columnspan=2, sticky="w")
+
+    def _save_settings(self):
+        key    = self.llm_key_var.get().strip()
+        url    = self.llm_url_var.get().strip()
+        model  = self.llm_model_var.get().strip()
+        tokens = self.llm_tokens_var.get().strip()
+        if not key or not url:
+            self.settings_status.config(text="⚠️ API Key와 Base URL은 필수입니다.", foreground="red")
+            return
+        try:
+            save_llm_config(key, url, model, int(tokens))
+            self.settings_status.config(
+                text=f"✅ 저장 완료 → {CONFIG_FILE}", foreground="green")
+        except Exception as e:
+            self.settings_status.config(text=f"❌ 저장 실패: {e}", foreground="red")
+
+    def _test_llm(self):
+        self._save_settings()
+        self.settings_status.config(text="🔄 연결 테스트 중...", foreground="blue")
+        self.root.update_idletasks()
+        def _test():
+            try:
+                client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=[{"role": "user", "content": "안녕하세요. 연결 테스트입니다. 한 문장으로 답해주세요."}],
+                    max_tokens=100, temperature=0.1,
+                )
+                answer = resp.choices[0].message.content.strip()[:80]
+                self.root.after(0, lambda: self.settings_status.config(
+                    text=f"✅ 연결 성공! 응답: {answer}", foreground="green"))
+            except Exception as e:
+                self.root.after(0, lambda: self.settings_status.config(
+                    text=f"❌ 연결 실패: {e}", foreground="red"))
+        threading.Thread(target=_test, daemon=True).start()
 
     def _on_url(self, *_):
         pid = extract_page_id_from_url(self.url_var.get())
