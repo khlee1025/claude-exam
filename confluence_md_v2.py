@@ -43,19 +43,34 @@ def llm_summarize_page(title: str, markdown_text: str) -> str:
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content":
-                    "당신은 기업 업무 보고서 작성 전문가입니다. "
-                    "주어진 Confluence 페이지 내용을 분석하여 핵심만 요약하세요.\n"
-                    "형식:\n"
-                    "- **핵심 요약** (2~3 문장)\n"
-                    "- **완료된 사항**\n"
-                    "- **진행 중인 사항**\n"
-                    "- **이슈 / 리스크**\n"
-                    "한국어로 간결하게 작성. 없는 항목은 생략."},
+                    "당신은 400명 규모 조직의 팀장을 위한 업무 보고서 작성 전문가입니다.\n\n"
+                    "【작성 원칙】\n"
+                    "1. 반드시 제공된 문서 내용만을 근거로 작성하세요. 추측하거나 내용을 창작하지 마세요.\n"
+                    "2. 팀장은 각 담당자의 전문 기술을 잘 모를 수 있습니다. "
+                    "   전문 용어가 나오면 괄호 안에 쉬운 말로 설명을 덧붙이세요.\n"
+                    "   예) 'API 연동(시스템끼리 데이터를 주고받는 연결 작업)'\n"
+                    "3. 격식 있는 문어체로 작성하세요. (~하였습니다, ~진행 중에 있습니다)\n"
+                    "4. 누가 읽어도 이해할 수 있도록 쉽고 구체적으로 풀어 쓰세요.\n"
+                    "5. 수치, 날짜, 완료 여부 등 구체적인 사실은 그대로 포함하세요.\n\n"
+                    "【보고서 형식】\n"
+                    "## 개요\n"
+                    "(이 업무가 무엇인지, 왜 하는지 2~3문장으로 쉽게 설명)\n\n"
+                    "## 이번 주 주요 내용\n"
+                    "(문서에 기록된 사실만, 불릿 포인트로)\n\n"
+                    "## 완료된 사항\n"
+                    "(없으면 생략)\n\n"
+                    "## 진행 중인 사항\n"
+                    "(없으면 생략)\n\n"
+                    "## 이슈 및 특이사항\n"
+                    "(없으면 생략)\n\n"
+                    "내용이 부족하거나 불명확한 경우 '문서에 해당 내용이 명시되지 않았습니다.'라고 표기하세요."},
                 {"role": "user", "content":
-                    f"페이지 제목: {title}\n\n내용:\n{markdown_text[:5000]}"}
+                    f"아래 Confluence 페이지 내용을 바탕으로 팀장 보고용 요약을 작성해주세요.\n\n"
+                    f"페이지 제목: {title}\n\n"
+                    f"=== 문서 내용 ===\n{markdown_text[:5000]}"}
             ],
             max_tokens=LLM_MAX_TOKENS,
-            temperature=0.3,
+            temperature=0.1,
         )
         return resp.choices[0].message.content
     except Exception as e:
@@ -100,20 +115,37 @@ def llm_generate_report(selected_md_contents: List[Dict]) -> str:
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content":
-                    "당신은 기업 업무 보고서 작성 전문가입니다.\n"
-                    "여러 Confluence 페이지를 종합해 경영진 보고서를 작성하세요.\n\n"
-                    "보고서 형식:\n"
-                    "1. 전체 요약\n"
-                    "2. 주요 성과 및 완료 항목\n"
-                    "3. 진행 중인 주요 과제\n"
-                    "4. 공통 이슈 및 리스크\n"
-                    "5. 다음 단계 / 액션 아이템\n\n"
-                    "한국어, 명확하고 간결하게, 불릿 포인트 활용."},
+                    "당신은 400명 규모 조직의 팀장을 위한 종합 업무 보고서 작성 전문가입니다.\n\n"
+                    "【작성 원칙】\n"
+                    "1. 제공된 각 페이지의 내용만을 근거로 작성하세요. 절대로 내용을 지어내거나 추측하지 마세요.\n"
+                    "2. 팀장은 각 팀원의 전문 업무를 모두 알지 못합니다. "
+                    "   전문 용어는 반드시 쉬운 말로 풀어 설명하세요.\n"
+                    "   예) 'CI/CD 파이프라인(코드 수정 시 자동으로 테스트하고 배포하는 시스템)'\n"
+                    "3. 격식 있는 문어체를 사용하세요. (~하였습니다, ~검토 중에 있습니다)\n"
+                    "4. 각 팀/담당자별로 무엇을 하는지 모르는 사람도 이해할 수 있게 구체적으로 설명하세요.\n"
+                    "5. 수치, 날짜, 완료율 등 구체적인 정보는 그대로 포함하세요.\n"
+                    "6. 문서에 없는 내용은 절대 추가하지 마세요.\n\n"
+                    "【보고서 구성】\n"
+                    "# 1. 전체 요약\n"
+                    "(전체 내용을 처음 보는 사람도 이해할 수 있게 3~5문장으로 요약)\n\n"
+                    "# 2. 항목별 상세 현황\n"
+                    "(각 페이지/팀별로, 업무 내용 + 현재 상태를 쉽게 풀어서)\n\n"
+                    "# 3. 완료된 주요 사항\n"
+                    "(이번 기간 내 완료된 것들, 없으면 생략)\n\n"
+                    "# 4. 진행 중인 주요 과제\n"
+                    "(현재 진행 중인 것들과 예상 완료 시점)\n\n"
+                    "# 5. 이슈 및 리스크\n"
+                    "(문제가 되거나 주의가 필요한 사항, 없으면 생략)\n\n"
+                    "# 6. 조치 필요 사항\n"
+                    "(팀장이 결정하거나 확인해야 할 사항, 없으면 생략)\n\n"
+                    "한국어 격식체로 작성. 문서에 없는 내용은 절대 추가하지 않음."},
                 {"role": "user", "content":
-                    f"다음 페이지들을 종합 분석해 보고서를 작성해주세요:\n{combined}"}
+                    f"아래 {len(selected_md_contents)}개 페이지의 내용을 바탕으로 팀장 보고용 종합 보고서를 작성해주세요.\n"
+                    f"반드시 아래 제공된 내용만 사용하고, 없는 내용은 만들지 마세요.\n\n"
+                    f"=== 각 페이지 내용 ===\n{combined}"}
             ],
             max_tokens=LLM_MAX_TOKENS * 2,
-            temperature=0.3,
+            temperature=0.1,
         )
         return resp.choices[0].message.content
     except Exception as e:
@@ -491,88 +523,4 @@ class ReportTab(ttk.Frame):
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_box = tk.Text(lf2, height=10, yscrollcommand=sb2.set, wrap=tk.WORD)
         self.log_box.pack(fill=tk.BOTH, expand=True)
-        sb2.config(command=self.log_box.yview)
-
-    def _load_folder(self):
-        d = filedialog.askdirectory()
-        if not d: return
-        found = []
-        for root, _, files in os.walk(d):
-            for f in files:
-                if f.endswith(".md"):
-                    found.append(os.path.join(root, f))
-        self._add_files(sorted(found))
-
-    def _load_files(self):
-        files = filedialog.askopenfilenames(
-            filetypes=[("Markdown", "*.md"), ("All", "*.*")])
-        self._add_files(list(files))
-
-    def _add_files(self, paths):
-        for p in paths:
-            if p not in self.md_files:
-                self.md_files.append(p)
-                self.file_list.insert(tk.END, os.path.basename(p))
-
-    def _remove_selected(self):
-        for i in reversed(self.file_list.curselection()):
-            self.file_list.delete(i)
-            self.md_files.pop(i)
-
-    def log(self, msg):
-        try:
-            self.log_box.insert(tk.END, msg + "\n")
-            self.log_box.see(tk.END)
-            self.update_idletasks()
-        except: pass
-
-    def _generate(self):
-        if not self.md_files:
-            messagebox.showwarning("경고", "MD 파일을 먼저 선택하세요.")
-            return
-        self.btn.config(state="disabled")
-        self.prog.start()
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def _worker(self):
-        try:
-            self.log(f"선택된 파일: {len(self.md_files)}개")
-            contents = []
-            for path in self.md_files:
-                with open(path, encoding="utf-8") as f:
-                    text = f.read()
-                title = os.path.basename(path).replace(".md", "")
-                contents.append({"title": title, "content": text})
-                self.log(f"  읽기 완료: {title}")
-
-            self.log("\nLLM 보고서 생성 중...")
-            report_md = llm_generate_report(contents)
-
-            os.makedirs(self.out_var.get(), exist_ok=True)
-            ts    = datetime.now().strftime("%Y%m%d_%H%M")
-            title = self.report_title_var.get()
-            fname = os.path.join(self.out_var.get(), f"{title}_{ts}.md")
-
-            header = (
-                f"# {title}\n\n"
-                f"---\n"
-                f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"참고 파일: {len(self.md_files)}개\n"
-                f"---\n\n"
-            )
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write(header + report_md)
-
-            self.log(f"\n✅ 보고서 저장 완료: {fname}")
-            messagebox.showinfo("완료", f"보고서 생성 완료!\n{fname}")
-
-        except Exception as e:
-            self.log(f"[오류] {e}\n{traceback.format_exc()}")
-            messagebox.showerror("오류", str(e))
-        finally:
-            self.after(0, lambda: (self.prog.stop(), self.btn.config(state="normal")))
-
-
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    App().mainloop()
+      
