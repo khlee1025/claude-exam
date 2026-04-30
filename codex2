@@ -1,0 +1,1675 @@
+""" confluence_md_v2_image_robust.py
+
+Confluence 차일드 페이지 수집 + Markdown 저장 + Vision LLM 이미지 분석 + 보고서 생성 GUI
+
+이번 통합본의 핵심 보강점:
+
+1. 기존 GUI/수집/보고서/Word 변환 구조 유지
+
+
+2. Confluence 이미지 다운로드 결과가 진짜 이미지인지 검사
+
+
+3. PNG/JPG/WebP/GIF/BMP 등을 Vision 모델이 안정적으로 읽도록 JPEG로 표준화
+
+
+4. MIME 타입을 무조건 image/png로 고정하지 않고 실제/표준화 타입으로 전달
+
+
+5. Confluence storage의 ac:image / ri:attachment 형태도 일부 대응
+
+
+6. 이미지 분석 실패 시 Markdown에 원인 표시
+
+
+
+필요 패키지:
+
+beautifulsoup4
+
+html2text
+
+openai
+
+python-docx
+
+playwright
+
+pillow
+
+
+최초 1회 필요: python -m playwright install chromium """
+
+import os import re import io import glob import json import base64 import threading import traceback import subprocess import sys from datetime import datetime from typing import Dict, List, Optional, Tuple from urllib.parse import urljoin, quote
+
+import tkinter as tk from tkinter import ttk, filedialog, messagebox
+
+─────────────────────────────────────────────
+
+패키지 자동 설치
+
+─────────────────────────────────────────────
+
+def _install(pkg: str): subprocess.check_call( [sys.executable, "-m", "pip", "install", pkg, "-q"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, )
+
+_REQUIRED_PACKAGES = [ ("beautifulsoup4", "bs4"), ("html2text", "html2text"), ("openai", "openai"), ("python-docx", "docx"), ("playwright", "playwright"), ("pillow", "PIL"), ]
+
+for _pkg, _import_name in _REQUIRED_PACKAGES: try: import(_import_name) except ImportError: print(f"{_pkg} 설치 중...") _install(_pkg)
+
+from bs4 import BeautifulSoup import html2text from openai import OpenAI from PIL import Image
+
+from docx import Document from docx.shared import Pt, Cm, RGBColor from docx.enum.text import WD_ALIGN_PARAGRAPH from docx.oxml.ns import qn from docx.oxml import OxmlElement
+
+─────────────────────────────────────────────
+
+색상 팔레트
+
+─────────────────────────────────────────────
+
+BLUE       = "#5A6C7D" BLUE_DK    = "#4A5568" BLUE_LT    = "#E2E8F0" CYAN       = "#718096" BG         = "#E8E9EB" CARD       = "#F7F8FA" BORDER     = "#D1D5DB" TEXT       = "#2D3748" TEXT_MUTED = "#718096" GREEN      = "#68756E" RED        = "#A05A5A" ORANGE     = "#B58A5A" LOG_BG     = "#2D3748" LOG_FG     = "#E8E9EB" LOG_GREEN  = "#68756E" LOG_RED    = "#A05A5A" LOG_BLUE   = "#5A6C7D" LOG_YELLOW = "#B58A5A"
+
+─────────────────────────────────────────────
+
+설정
+
+─────────────────────────────────────────────
+
+BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "https://confluence.sec.samsung.net").rstrip("/") USER_DATA_DIR = os.getenv("CONFLUENCE_PROFILE_DIR", "./chrome_profile_confluence_md") CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(file)), "llm_config.json")
+
+이미지 디버그 파일 저장 여부. 필요하면 환경변수 SAVE_DEBUG_IMAGES=1 로 실행.
+
+SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "0") == "1"
+
+기본값. 실제 환경 값은 GUI의 LLM 설정 탭에서 저장해서 사용 가능.
+
+LLM_API_KEY      = os.getenv("LLM_API_KEY", "") LLM_BASE_URL     = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1") LLM_MODEL        = os.getenv("LLM_MODEL", "Qwen3.5-122B") LLM_VISION_MODEL = os.getenv("LLM_VISION_MODEL", "Qwen3.5-122B") LLM_MAX_TOKENS   = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+
+─────────────────────────────────────────────
+
+공통 유틸
+
+─────────────────────────────────────────────
+
+def clean_filename(title: str) -> str: title = title or "untitled" title = re.sub(r"[\/*?:"<>|]", "_", title).strip() title = re.sub(r"\s+", " ", title) return title[:120] or "untitled"
+
+def extract_page_id_from_url(url: str) -> Optional[str]: m = re.search(r"/pages/(\d+)", url) if m: return m.group(1)
+
+m = re.search(r"pageId=(\d+)", url)
+if m:
+    return m.group(1)
+
+m = re.search(r"/display/[^/]+/.*[?&]pageId=(\d+)", url)
+if m:
+    return m.group(1)
+
+return None
+
+def safe_get_header(headers: Dict, name: str, default: str = "") -> str: if not headers: return default lname = name.lower() for k, v in headers.items(): if str(k).lower() == lname: return str(v) return default
+
+def save_debug_bytes(debug_dir: Optional[str], prefix: str, data: bytes, ext: str = "bin") -> Optional[str]: if not SAVE_DEBUG_IMAGES or not debug_dir: return None try: os.makedirs(debug_dir, exist_ok=True) ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f") path = os.path.join(debug_dir, f"{prefix}_{ts}.{ext}") with open(path, "wb") as f: f.write(data) return path except Exception: return None
+
+─────────────────────────────────────────────
+
+LLM 설정
+
+─────────────────────────────────────────────
+
+def load_llm_config(): global LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_VISION_MODEL, LLM_MAX_TOKENS
+
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        LLM_API_KEY = cfg.get("api_key", LLM_API_KEY)
+        LLM_BASE_URL = cfg.get("base_url", LLM_BASE_URL)
+        LLM_MODEL = cfg.get("model", LLM_MODEL)
+        LLM_VISION_MODEL = cfg.get("vision_model", LLM_VISION_MODEL)
+        LLM_MAX_TOKENS = int(cfg.get("max_tokens", LLM_MAX_TOKENS))
+    except Exception as e:
+        print(f"[설정 불러오기 실패] {e}")
+
+def save_llm_config(api_key, base_url, model, vision_model, max_tokens): global LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_VISION_MODEL, LLM_MAX_TOKENS
+
+LLM_API_KEY = api_key
+LLM_BASE_URL = base_url.rstrip("/")
+LLM_MODEL = model
+LLM_VISION_MODEL = vision_model
+LLM_MAX_TOKENS = int(max_tokens)
+
+with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump(
+        {
+            "api_key": api_key,
+            "base_url": LLM_BASE_URL,
+            "model": model,
+            "vision_model": vision_model,
+            "max_tokens": int(max_tokens),
+        },
+        f,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+load_llm_config()
+
+def _llm(): key = LLM_API_KEY if LLM_API_KEY else "sk-ignored" return OpenAI(api_key=key, base_url=LLM_BASE_URL)
+
+─────────────────────────────────────────────
+
+이미지 판별 / 표준화 / Vision 전달
+
+─────────────────────────────────────────────
+
+def detect_image_type(image_bytes: bytes, content_type: str = "") -> str: """응답 헤더와 파일 시그니처를 이용해 이미지 타입을 판별한다.""" ct = (content_type or "").split(";")[0].strip().lower()
+
+if ct.startswith("image/"):
+    return ct
+
+head = image_bytes[:64]
+stripped = image_bytes[:512].lstrip().lower()
+
+if head.startswith(b"\x89PNG"):
+    return "image/png"
+if head.startswith(b"\xff\xd8\xff"):
+    return "image/jpeg"
+if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+    return "image/gif"
+if head.startswith(b"RIFF") and b"WEBP" in head[:16]:
+    return "image/webp"
+if head.startswith(b"BM"):
+    return "image/bmp"
+if stripped.startswith(b"<svg") or b"<svg" in stripped[:200]:
+    return "image/svg+xml"
+if stripped.startswith(b"<!doctype html") or stripped.startswith(b"<html"):
+    return "text/html"
+if stripped.startswith(b"<?xml") and b"<svg" in stripped[:500]:
+    return "image/svg+xml"
+
+return "application/octet-stream"
+
+def _resize_for_vision(img: Image.Image, max_side: int = 1800) -> Image.Image: w, h = img.size longest = max(w, h) if longest <= max_side: return img
+
+scale = max_side / float(longest)
+new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+
+try:
+    resample = Image.Resampling.LANCZOS
+except AttributeError:
+    resample = Image.LANCZOS
+
+return img.resize(new_size, resample)
+
+def prepare_image_for_vision( image_bytes: bytes, content_type: str = "", max_side: int = 1800, ) -> Tuple[str, bytes, str]: """ Confluence에서 받은 이미지 바이트를 Vision LLM이 잘 읽는 JPEG/PNG로 표준화한다.
+
+반환:
+- mime_type: 최종 MIME 타입
+- normalized_bytes: 표준화된 이미지 바이트
+- note: 처리 과정 설명
+"""
+if not image_bytes:
+    raise ValueError("빈 이미지 데이터입니다.")
+
+original_mime = detect_image_type(image_bytes, content_type)
+
+if original_mime == "text/html":
+    raise ValueError("이미지 대신 HTML이 다운로드되었습니다. 로그인/권한/이미지 URL 문제일 수 있습니다.")
+
+if original_mime == "image/svg+xml":
+    # SVG는 서버/환경에 따라 cairosvg가 없으면 렌더링이 어렵다.
+    # 여기서는 명확히 실패 처리해서 MD에 원인을 남긴다.
+    raise ValueError("SVG 이미지는 현재 직접 분석 전에 PNG/JPEG 렌더링이 필요합니다.")
+
+if not original_mime.startswith("image/"):
+    raise ValueError(f"이미지로 판별되지 않는 응답입니다: {original_mime}")
+
+try:
+    img = Image.open(io.BytesIO(image_bytes))
+    img.load()
+except Exception as e:
+    raise ValueError(f"Pillow가 이미지를 열지 못했습니다: {e}")
+
+# GIF/WebP 애니메이션은 첫 프레임만 사용
+try:
+    if getattr(img, "is_animated", False):
+        img.seek(0)
+except Exception:
+    pass
+
+# 투명 배경 이미지 대응
+if img.mode in ("RGBA", "LA", "P"):
+    bg = Image.new("RGB", img.convert("RGBA").size, (255, 255, 255))
+    rgba = img.convert("RGBA")
+    bg.paste(rgba, mask=rgba.split()[-1])
+    img = bg
+elif img.mode != "RGB":
+    img = img.convert("RGB")
+
+original_size = img.size
+img = _resize_for_vision(img, max_side=max_side)
+resized_size = img.size
+
+out = io.BytesIO()
+img.save(out, format="JPEG", quality=92, optimize=True)
+final_bytes = out.getvalue()
+
+note = f"original={original_mime}, size={original_size[0]}x{original_size[1]}, final=image/jpeg, final_size={resized_size[0]}x{resized_size[1]}"
+return "image/jpeg", final_bytes, note
+
+def llm_analyze_image(image_bytes: bytes, context: str = "", content_type: str = "") -> str: """이미지 바이트를 Vision LLM으로 분석한다.""" try: mime_type, fixed_bytes, note = prepare_image_for_vision(image_bytes, content_type=content_type) b64 = base64.b64encode(fixed_bytes).decode("ascii")
+
+messages = [
+        {
+            "role": "system",
+            "content": (
+                "당신은 기업 문서의 이미지, 차트, 표, 다이어그램, 화면 캡처를 분석하는 전문가입니다. "
+                "이미지 안에 보이는 텍스트, 수치, 범례, 상태, 흐름을 최대한 정확히 읽고 한국어로 설명하세요. "
+                "확인되지 않는 내용은 추측하지 말고 '이미지에서 확인되지 않음'이라고 작성하세요. "
+                "업무 보고서에 바로 넣을 수 있게 간결하고 명확하게 정리하세요."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "다음 이미지를 분석해주세요.\n\n"
+                        f"문맥/alt: {context or '없음'}\n"
+                        f"이미지 전처리 정보: {note}\n\n"
+                        "작성 형식:\n"
+                        "- 이미지 유형: 사진/차트/표/다이어그램/화면 캡처 중 판단\n"
+                        "- 보이는 핵심 텍스트/수치\n"
+                        "- 핵심 의미 요약\n"
+                        "- 업무상 시사점 또는 주의사항\n"
+                        "단, 보이지 않는 내용은 절대 만들어내지 마세요."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        },
+    ]
+
+    resp = _llm().chat.completions.create(
+        model=LLM_VISION_MODEL,
+        messages=messages,
+        max_tokens=1000,
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+except Exception as e:
+    return f"[이미지 분석 실패: {e}]"
+
+─────────────────────────────────────────────
+
+LLM 텍스트 분석
+
+─────────────────────────────────────────────
+
+def llm_summarize_page(title: str, markdown_text: str) -> str: """페이지 Markdown 내용을 LLM으로 요약한다.""" try: resp = _llm().chat.completions.create( model=LLM_MODEL, messages=[ { "role": "system", "content": ( "당신은 기업 업무 보고서 작성 전문가입니다. " "주어진 Confluence 페이지 내용을 분석하여 핵심만 요약하세요.\n" "형식:\n" "- 핵심 요약 (2~3 문장)\n" "- 완료된 사항\n" "- 진행 중인 사항\n" "- 이슈 / 리스크\n" "한국어로 간결하게 작성. 없는 항목은 생략." ), }, { "role": "user", "content": f"페이지 제목: {title}\n\n내용:\n{markdown_text[:8000]}", }, ], max_tokens=LLM_MAX_TOKENS, temperature=0.3, ) return resp.choices[0].message.content.strip() except Exception as e: return f"[LLM 요약 실패: {e}]"
+
+def llm_generate_report(selected_md_contents: List[Dict]) -> str: """여러 Markdown 파일을 종합해 보고서를 생성한다.""" combined = "" for item in selected_md_contents: combined += f"\n\n### {item['title']}\n{item['content']}"
+
+try:
+    resp = _llm().chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "당신은 400명 규모 조직의 팀장을 위한 종합 업무 보고서 작성 전문가입니다.\n\n"
+                    "【작성 원칙】\n"
+                    "1. 반드시 제공된 문서 내용만을 근거로 작성하세요. 추측하거나 내용을 창작하지 마세요.\n"
+                    "2. 팀장은 각 담당자의 전문 기술을 잘 모를 수 있습니다. 전문 용어가 나오면 괄호 안에 쉬운 말로 설명을 덧붙이세요.\n"
+                    "3. 격식 있는 문어체로 작성하세요. (~하였습니다, ~진행 중에 있습니다)\n"
+                    "4. 누구나 이해할 수 있도록 쉽고 구체적으로 풀어 쓰세요.\n"
+                    "5. 수치, 날짜, 완료 여부 등 구체적인 사실은 그대로 포함하세요.\n\n"
+                    "【보고서 구성】\n"
+                    "# 1. 전체 요약\n"
+                    "# 2. 항목별 상세 현황\n"
+                    "# 3. 완료된 주요 사항\n"
+                    "# 4. 진행 중인 주요 과제\n"
+                    "# 5. 이슈 및 리스크\n"
+                    "# 6. 다음 단계 / 액션 아이템\n\n"
+                    "문서에 없는 내용은 절대 추가하지 마세요."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"아래 {len(selected_md_contents)}개 페이지의 내용을 바탕으로 종합 보고서를 작성해주세요.\n\n"
+                    "반드시 아래 제공된 내용만 사용하고, 없는 내용은 만들지 마세요.\n\n"
+                    f"=== 각 페이지 내용 ===\n{combined}"
+                ),
+            },
+        ],
+        max_tokens=LLM_MAX_TOKENS * 3,
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+except Exception as e:
+    return f"[보고서 생성 실패: {e}]"
+
+─────────────────────────────────────────────
+
+MD → Word 변환 엔진
+
+─────────────────────────────────────────────
+
+class MDConverter: """Markdown을 Word(.docx)로 변환하는 클래스"""
+
+HEADING_COLORS = {
+    1: RGBColor(0x14, 0x28, 0xA0),
+    2: RGBColor(0x1F, 0x49, 0x7D),
+    3: RGBColor(0x2E, 0x74, 0xB5),
+    4: RGBColor(0x44, 0x72, 0xC4),
+}
+HEADING_SIZES = {1: 18, 2: 15, 3: 13, 4: 12}
+
+def _set_run_font(self, run, name="맑은 고딕", size=None, bold=None, italic=None):
+    run.font.name = name
+    if size is not None:
+        run.font.size = Pt(size)
+    if bold is not None:
+        run.bold = bold
+    if italic is not None:
+        run.italic = italic
+
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.rFonts
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    rFonts.set(qn("w:eastAsia"), name)
+
+def _new_doc(self) -> Document:
+    doc = Document()
+
+    for section in doc.sections:
+        section.page_width = Cm(21)
+        section.page_height = Cm(29.7)
+        section.left_margin = section.right_margin = Cm(2.5)
+        section.top_margin = section.bottom_margin = Cm(2.5)
+
+    style = doc.styles["Normal"]
+    style.font.name = "맑은 고딕"
+    style.font.size = Pt(11)
+    style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
+    return doc
+
+def _add_heading(self, doc, text, level):
+    level = min(max(level, 1), 4)
+    p = doc.add_heading("", level=level)
+    run = p.add_run(text)
+    self._set_run_font(run, "맑은 고딕", size=self.HEADING_SIZES[level], bold=True)
+    run.font.color.rgb = self.HEADING_COLORS[level]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    return p
+
+def _add_paragraph(self, doc, text, bold=False, italic=False, size=11):
+    if not text.strip():
+        return doc.add_paragraph()
+    p = doc.add_paragraph()
+    self._add_inline(p, text, base_bold=bold, base_italic=italic, size=size)
+    return p
+
+def _add_inline(self, para, text, base_bold=False, base_italic=False, size=11):
+    """**bold**, *italic*, `code` 인라인 처리"""
+    pattern = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)")
+    last = 0
+
+    for m in pattern.finditer(text):
+        if m.start() > last:
+            run = para.add_run(text[last:m.start()])
+            self._set_run_font(run, "맑은 고딕", size=size, bold=base_bold, italic=base_italic)
+
+        raw = m.group(0)
+        if raw.startswith("**"):
+            run = para.add_run(m.group(2))
+            self._set_run_font(run, "맑은 고딕", size=size, bold=True, italic=base_italic)
+        elif raw.startswith("*"):
+            run = para.add_run(m.group(3))
+            self._set_run_font(run, "맑은 고딕", size=size, bold=base_bold, italic=True)
+        elif raw.startswith("`"):
+            run = para.add_run(m.group(4))
+            self._set_run_font(run, "Consolas", size=max(size - 1, 8))
+            run.font.color.rgb = RGBColor(0xC0, 0x39, 0x2B)
+
+        last = m.end()
+
+    if last < len(text):
+        run = para.add_run(text[last:])
+        self._set_run_font(run, "맑은 고딕", size=size, bold=base_bold, italic=base_italic)
+
+def _add_bullet(self, doc, text, level=0):
+    style = "List Bullet" if level == 0 else "List Bullet 2"
+    p = doc.add_paragraph(style=style)
+    self._add_inline(p, text.lstrip("-•* ").strip())
+    return p
+
+def _add_numbered(self, doc, text):
+    p = doc.add_paragraph(style="List Number")
+    clean = re.sub(r"^\d+\.\s*", "", text)
+    self._add_inline(p, clean)
+    return p
+
+def _add_table(self, doc, headers, rows):
+    cols = max(len(headers), max((len(r) for r in rows), default=1))
+    table = doc.add_table(rows=1 + len(rows), cols=cols)
+    table.style = "Table Grid"
+
+    hrow = table.rows[0]
+    for i, h in enumerate(headers[:cols]):
+        cell = hrow.cells[i]
+        cell.text = ""
+        run = cell.paragraphs[0].add_run(h)
+        self._set_run_font(run, "맑은 고딕", size=10, bold=True)
+
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = tc.makeelement(
+            qn("w:shd"),
+            {qn("w:val"): "clear", qn("w:color"): "auto", qn("w:fill"): "1428A0"},
+        )
+        tcPr.append(shd)
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+    for ri, row in enumerate(rows):
+        for ci in range(cols):
+            val = row[ci] if ci < len(row) else ""
+            cell = table.rows[ri + 1].cells[ci]
+            cell.text = ""
+            run = cell.paragraphs[0].add_run(val)
+            self._set_run_font(run, "맑은 고딕", size=10)
+
+            if ri % 2 == 1:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                shd = tc.makeelement(
+                    qn("w:shd"),
+                    {qn("w:val"): "clear", qn("w:color"): "auto", qn("w:fill"): "F0F4FF"},
+                )
+                tcPr.append(shd)
+
+    doc.add_paragraph()
+    return table
+
+def _add_code_block(self, doc, code):
+    p = doc.add_paragraph()
+    run = p.add_run(code)
+    self._set_run_font(run, "Consolas", size=9)
+    run.font.color.rgb = RGBColor(0x20, 0x20, 0x20)
+
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    for side in ["top", "bottom", "left", "right"]:
+        bdr = OxmlElement(f"w:{side}")
+        bdr.set(qn("w:val"), "single")
+        bdr.set(qn("w:sz"), "4")
+        bdr.set(qn("w:space"), "2")
+        bdr.set(qn("w:color"), "C0C0C0")
+        pBdr.append(bdr)
+    pPr.append(pBdr)
+
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), "F6F8FA")
+    pPr.append(shd)
+    return p
+
+def _add_hr(self, doc):
+    p = doc.add_paragraph()
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "1428A0")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+def convert(self, md_text: str, title: str = "", add_cover: bool = True) -> Document:
+    doc = self._new_doc()
+
+    if add_cover and title:
+        doc.add_paragraph()
+        doc.add_paragraph()
+        doc.add_paragraph()
+
+        p = doc.add_paragraph()
+        run = p.add_run(title)
+        self._set_run_font(run, "맑은 고딕", size=22, bold=True)
+        run.font.color.rgb = RGBColor(0x14, 0x28, 0xA0)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        doc.add_paragraph()
+        p2 = doc.add_paragraph()
+        run2 = p2.add_run(f"작성일: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        self._set_run_font(run2, "맑은 고딕", size=11)
+        run2.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        doc.add_page_break()
+
+    lines = md_text.split("\n")
+    i = 0
+    in_code = False
+    code_lines = []
+    table_headers = []
+    table_rows = []
+
+    def flush_table():
+        nonlocal table_headers, table_rows
+        if table_headers or table_rows:
+            self._add_table(doc, table_headers, table_rows)
+            table_headers = []
+            table_rows = []
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            if not in_code:
+                flush_table()
+                in_code = True
+                code_lines = []
+            else:
+                in_code = False
+                self._add_code_block(doc, "\n".join(code_lines))
+            i += 1
+            continue
+
+        if in_code:
+            code_lines.append(line)
+            i += 1
+            continue
+
+        if not stripped:
+            flush_table()
+            doc.add_paragraph()
+            i += 1
+            continue
+
+        if re.match(r"^[-*_]{3,}$", stripped):
+            flush_table()
+            self._add_hr(doc)
+            i += 1
+            continue
+
+        m = re.match(r"^(#{1,6})\s+(.*)", stripped)
+        if m:
+            flush_table()
+            self._add_heading(doc, m.group(2), len(m.group(1)))
+            i += 1
+            continue
+
+        if stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if all(re.match(r"^[-:]+$", c) for c in cells if c):
+                i += 1
+                continue
+            if not table_headers:
+                table_headers = cells
+            else:
+                table_rows.append(cells)
+            i += 1
+            continue
+
+        if table_headers and not stripped.startswith("|"):
+            flush_table()
+
+        if re.match(r"^[-*•]\s+", stripped):
+            flush_table()
+            self._add_bullet(doc, stripped)
+            i += 1
+            continue
+
+        if re.match(r"^\s{2,}[-*•]\s+", line):
+            flush_table()
+            self._add_bullet(doc, stripped, level=1)
+            i += 1
+            continue
+
+        if re.match(r"^\d+\.\s+", stripped):
+            flush_table()
+            self._add_numbered(doc, stripped)
+            i += 1
+            continue
+
+        if stripped.startswith(">"):
+            flush_table()
+            p = doc.add_paragraph()
+            run = p.add_run(stripped.lstrip("> "))
+            self._set_run_font(run, "맑은 고딕", size=10, italic=True)
+            run.font.color.rgb = RGBColor(0x6B, 0x72, 0x80)
+            pPr = p._p.get_or_add_pPr()
+            ind = OxmlElement("w:ind")
+            ind.set(qn("w:left"), "720")
+            pPr.append(ind)
+            i += 1
+            continue
+
+        flush_table()
+        self._add_paragraph(doc, stripped)
+        i += 1
+
+    flush_table()
+
+    for section in doc.sections:
+        footer = section.footer
+        fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        fp.text = f"  {title}  |  {datetime.now().strftime('%Y-%m-%d')}  "
+        fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in fp.runs:
+            self._set_run_font(run, "맑은 고딕", size=8)
+            run.font.color.rgb = RGBColor(0x9C, 0xA3, 0xAF)
+
+    return doc
+
+def convert_file(self, md_path: str, out_path: str = None, add_cover: bool = True, callback=None) -> str:
+    with open(md_path, encoding="utf-8") as f:
+        md_text = f.read()
+
+    title = os.path.basename(md_path).replace(".md", "")
+    if callback:
+        callback(f"INFO: 변환 중: {title}")
+
+    doc = self.convert(md_text, title=title, add_cover=add_cover)
+
+    if out_path is None:
+        out_path = md_path.replace(".md", ".docx")
+
+    doc.save(out_path)
+
+    if callback:
+        callback(f"OK: 저장 완료 → {out_path}")
+
+    return out_path
+
+def convert_folder(self, folder: str, out_folder: str = None, merge: bool = False, add_cover: bool = True, callback=None) -> list:
+    md_files = sorted(glob.glob(os.path.join(folder, "**", "*.md"), recursive=True))
+    md_files = [f for f in md_files if "보고서" not in os.path.basename(f) or not merge]
+
+    if not md_files:
+        if callback:
+            callback("WARN: MD 파일 없음")
+        return []
+
+    if callback:
+        callback(f"INFO: MD 파일 {len(md_files)}개 발견")
+
+    if merge:
+        combined = ""
+        for fp in md_files:
+            fname = os.path.basename(fp).replace(".md", "")
+            with open(fp, encoding="utf-8") as f:
+                text = f.read()
+            combined += f"\n\n---\n\n# {fname}\n\n{text}"
+
+        title = os.path.basename(folder) + " 통합 보고서"
+        doc = self.convert(combined, title=title, add_cover=add_cover)
+        out = os.path.join(out_folder or folder, f"{title}.docx")
+        doc.save(out)
+
+        if callback:
+            callback(f"OK: 통합 문서 저장 → {out}")
+
+        return [out]
+
+    results = []
+    odir = out_folder or folder
+    os.makedirs(odir, exist_ok=True)
+
+    for fp in md_files:
+        fname = os.path.basename(fp).replace(".md", "")
+        out = os.path.join(odir, fname + ".docx")
+        try:
+            self.convert_file(fp, out, add_cover=add_cover, callback=callback)
+            results.append(out)
+        except Exception as e:
+            if callback:
+                callback(f"ERR: {fname} 실패 - {e}")
+
+    return results
+
+─────────────────────────────────────────────
+
+Confluence API
+
+─────────────────────────────────────────────
+
+def get_page_content(page_session, page_id: str) -> Optional[Dict]: try: resp = page_session.request.get( f"{BASE_URL}/rest/api/content/{page_id}", params={"expand": "body.storage"}, ) if resp.status != 200: return None
+
+d = resp.json()
+    return {
+        "id": d.get("id"),
+        "title": d.get("title", ""),
+        "html": d.get("body", {}).get("storage", {}).get("value", ""),
+    }
+except Exception:
+    return None
+
+def get_children(page_session, parent_id: str) -> List[Dict]: pages = [] start = 0 limit = 50
+
+while True:
+    try:
+        resp = page_session.request.get(
+            f"{BASE_URL}/rest/api/content/search",
+            params={
+                "cql": f"ancestor={parent_id} and type=page",
+                "start": str(start),
+                "limit": str(limit),
+                "expand": "version",
+            },
+        )
+        if resp.status != 200:
+            break
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for doc in results:
+            pages.append({"id": doc["id"], "title": doc["title"]})
+
+        if len(results) < limit:
+            break
+
+        start += limit
+        if start > 2000:
+            break
+    except Exception:
+        break
+
+return pages
+
+def find_attachment_download_url(page_session, page_id: str, filename: str) -> Optional[str]: """Confluence storage의 ri:attachment filename을 실제 다운로드 URL로 해석한다.""" if not filename: return None
+
+try:
+    resp = page_session.request.get(
+        f"{BASE_URL}/rest/api/content/{page_id}/child/attachment",
+        params={"filename": filename, "expand": "version"},
+    )
+    if resp.status != 200:
+        return None
+
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        return None
+
+    att = results[0]
+    links = att.get("_links", {})
+    download = links.get("download")
+    if download:
+        return urljoin(BASE_URL + "/", download)
+except Exception:
+    return None
+
+return None
+
+def download_image_bytes(page_session, image_url: str) -> Tuple[Optional[bytes], str, str]: """ 이미지 URL을 다운로드한다.
+
+반환:
+- bytes or None
+- content_type
+- error_message
+"""
+try:
+    resp = page_session.request.get(image_url)
+    if resp.status != 200:
+        return None, "", f"HTTP {resp.status}"
+
+    content_type = safe_get_header(resp.headers, "content-type", "")
+    data = resp.body()
+    return data, content_type, ""
+except Exception as e:
+    return None, "", str(e)
+
+─────────────────────────────────────────────
+
+HTML → Markdown 변환
+
+─────────────────────────────────────────────
+
+def replace_img_tag_with_analysis( soup: BeautifulSoup, tag, page_session, image_url: str, alt: str, debug_dir: Optional[str] = None, ): """하나의 이미지 태그/매크로를 Vision 분석 문단으로 치환한다.""" img_desc = None err_msg = ""
+
+if page_session and image_url:
+    img_bytes, content_type, err = download_image_bytes(page_session, image_url)
+
+    if err:
+        err_msg = f"다운로드 실패: {err}"
+    elif img_bytes:
+        mime = detect_image_type(img_bytes, content_type)
+
+        if mime == "text/html":
+            save_debug_bytes(debug_dir, "image_html_response", img_bytes, "html")
+            err_msg = "이미지 URL에서 HTML이 반환되었습니다. 로그인/권한/URL 문제 가능성이 있습니다."
+        elif len(img_bytes) < 500:
+            save_debug_bytes(debug_dir, "tiny_image", img_bytes, "bin")
+            err_msg = f"이미지가 너무 작아 분석 제외됨 ({len(img_bytes)} bytes, {mime})"
+        else:
+            save_debug_bytes(debug_dir, "image_original", img_bytes, "bin")
+            img_desc = llm_analyze_image(img_bytes, context=alt, content_type=content_type)
+    else:
+        err_msg = "빈 응답"
+
+replacement = soup.new_tag("p")
+
+if img_desc:
+    replacement.string = f"📸 **[이미지 분석: {alt or '이미지'}]**\n\n{img_desc}"
+else:
+    src_short = image_url[:120] if image_url else ""
+    replacement.string = f"📸 **[이미지: {alt or '이미지'}]** (분석 불가: {err_msg or '원인 미상'} / src: {src_short})"
+
+tag.replace_with(replacement)
+
+def html_to_markdown( html: str, page_session=None, base_url: str = "", page_id: Optional[str] = None, debug_dir: Optional[str] = None, ) -> str: """ html2text로 문서 순서를 유지한 Markdown 변환. 이미지는 다운로드 후 Vision LLM 분석 문단으로 교체한다. """ soup = BeautifulSoup(html or "", "html.parser")
+
+# 1) 일반 img 태그 처리
+for img in list(soup.find_all("img")):
+    src = img.get("src", "") or img.get("data-src", "")
+    alt = img.get("alt", "이미지") or img.get("title", "이미지")
+    if not src:
+        continue
+
+    full_src = src if src.startswith("http") else urljoin((base_url or BASE_URL) + "/", src)
+    replace_img_tag_with_analysis(
+        soup=soup,
+        tag=img,
+        page_session=page_session,
+        image_url=full_src,
+        alt=alt,
+        debug_dir=debug_dir,
+    )
+
+# 2) Confluence storage macro: ac:image / ri:attachment 처리
+# BeautifulSoup parser에 따라 태그명이 'ac:image' 그대로 들어오는 경우가 많다.
+if page_session and page_id:
+    for ac_img in list(soup.find_all(lambda t: getattr(t, "name", "") in ("ac:image", "image"))):
+        if ac_img.name != "ac:image":
+            continue
+
+        attachment = ac_img.find(lambda t: getattr(t, "name", "") == "ri:attachment")
+        if not attachment:
+            continue
+
+        filename = attachment.get("ri:filename") or attachment.get("filename")
+        if not filename:
+            continue
+
+        download_url = find_attachment_download_url(page_session, page_id, filename)
+        alt = filename
+
+        if download_url:
+            replace_img_tag_with_analysis(
+                soup=soup,
+                tag=ac_img,
+                page_session=page_session,
+                image_url=download_url,
+                alt=alt,
+                debug_dir=debug_dir,
+            )
+        else:
+            replacement = soup.new_tag("p")
+            replacement.string = f"📸 **[이미지: {filename}]** (분석 불가: 첨부파일 다운로드 URL을 찾지 못했습니다.)"
+            ac_img.replace_with(replacement)
+
+h = html2text.HTML2Text()
+h.ignore_links = False
+h.ignore_images = True
+h.body_width = 0
+h.protect_links = True
+h.wrap_links = False
+h.unicode_snob = True
+h.ignore_emphasis = False
+h.mark_code = True
+
+return h.handle(str(soup)).strip()
+
+─────────────────────────────────────────────
+
+페이지 처리
+
+─────────────────────────────────────────────
+
+def process_page( page_session, page_id: str, save_dir: str, depth: int, use_vision: bool, use_llm_summary: bool, callback=None, ): def log(msg): if callback: callback(msg)
+
+data = get_page_content(page_session, page_id)
+if not data:
+    log(f"  [실패] 페이지 가져오기 실패: {page_id}")
+    return
+
+title = data["title"]
+log(f"  처리 중: {title}")
+
+safe = clean_filename(title)
+debug_dir = os.path.join(save_dir, "_debug_images", f"{page_id}_{safe}") if SAVE_DEBUG_IMAGES else None
+
+ps = page_session if use_vision else None
+md_body = html_to_markdown(
+    data["html"],
+    page_session=ps,
+    base_url=BASE_URL,
+    page_id=page_id,
+    debug_dir=debug_dir,
+)
+
+llm_summary = ""
+if use_llm_summary:
+    log(f"    LLM 요약 중: {title}")
+    llm_summary = llm_summarize_page(title, md_body)
+
+md_lines = [
+    f"# {title}",
+    "",
+    "---",
+    f"페이지 ID: {page_id}",
+    f"생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    "---",
+    "",
+]
+
+if llm_summary:
+    md_lines += ["## 🤖 AI 요약", "", llm_summary, "", "---", ""]
+
+md_lines += ["## 원문 내용", "", md_body]
+
+path = os.path.join(save_dir, f"{page_id}_{safe}.md")
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(md_lines))
+
+log(f"  [저장] {path}")
+
+if depth > 0:
+    children = get_children(page_session, page_id)
+    if children:
+        child_dir = os.path.join(save_dir, f"sub_{safe}")
+        os.makedirs(child_dir, exist_ok=True)
+        for child in children:
+            process_page(
+                page_session,
+                child["id"],
+                child_dir,
+                depth - 1,
+                use_vision,
+                use_llm_summary,
+                callback,
+            )
+
+─────────────────────────────────────────────
+
+GUI 스타일
+
+─────────────────────────────────────────────
+
+def setup_apple_style(): style = ttk.Style() style.theme_use("clam")
+
+style.configure(".", background=BG, foreground=TEXT, font=("SF Pro Display", 11))
+style.configure("Card.TFrame", background=CARD, relief="flat")
+style.configure("TLabel", background=BG, foreground=TEXT, font=("SF Pro Display", 10))
+style.configure("Title.TLabel", font=("SF Pro Display", 14, "bold"), foreground=BLUE)
+style.configure("Muted.TLabel", foreground=TEXT_MUTED)
+
+style.configure(
+    "TButton",
+    background=BLUE,
+    foreground="white",
+    font=("SF Pro Display", 10, "bold"),
+    padding=(16, 8),
+)
+style.map("TButton", background=[("active", BLUE_DK), ("disabled", BORDER)])
+
+style.configure(
+    "TEntry",
+    fieldbackground=BG,
+    foreground=TEXT,
+    bordercolor=BLUE,
+    focuscolor=BLUE,
+    padding=(10, 8),
+)
+style.configure("TCheckbutton", background=BG, foreground=TEXT)
+style.configure("TProgressbar", background=BLUE, troughcolor=BORDER)
+style.configure("TNotebook", background=CARD, borderwidth=0)
+style.configure(
+    "TNotebook.Tab",
+    background=BG,
+    foreground=TEXT_MUTED,
+    font=("SF Pro Display", 11),
+    padding=[20, 10],
+)
+style.map("TNotebook.Tab", background=[("selected", CARD)], foreground=[("selected", BLUE)])
+style.configure("TScrollbar", background=BORDER, troughcolor=BG)
+style.configure("TSeparator", background=BORDER)
+
+class App(tk.Tk): def init(self): super().init() self.title("Confluence MD 수집 + 보고서 생성 v2") self.geometry("900x700") self.resizable(True, True)
+
+setup_apple_style()
+
+    nb = ttk.Notebook(self, style="TNotebook")
+    nb.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+    self.tab_crawl = CrawlTab(nb)
+    self.tab_report = ReportTab(nb)
+    self.tab_settings = SettingsTab(nb)
+
+    nb.add(self.tab_crawl, text="📥 수집")
+    nb.add(self.tab_report, text="📊 보고서 생성")
+    nb.add(self.tab_settings, text="⚙️ LLM 설정")
+
+─────────────────────────────────────────────
+
+수집 탭
+
+─────────────────────────────────────────────
+
+class CrawlTab(ttk.Frame): def init(self, parent): super().init(parent, style="Card.TFrame", padding=20) self._build()
+
+def _build(self):
+    ttk.Label(self, text="Confluence URL:", style="Title.TLabel").grid(row=0, column=0, sticky=tk.W, pady=8)
+
+    self.url_var = tk.StringVar()
+    ttk.Entry(self, textvariable=self.url_var, width=65, style="TEntry").grid(
+        row=0, column=1, columnspan=2, sticky=tk.EW, pady=8
+    )
+    self.url_var.trace_add("write", self._on_url)
+
+    self.pid_lbl = ttk.Label(self, text="페이지 ID: —", style="Muted.TLabel")
+    self.pid_lbl.grid(row=1, column=1, sticky=tk.W, pady=4)
+
+    ttk.Label(self, text="재귀 깊이:", style="TLabel").grid(row=2, column=0, sticky=tk.W, pady=8)
+    self.depth_var = tk.IntVar(value=3)
+    ttk.Spinbox(self, from_=0, to=10, textvariable=self.depth_var, width=8).grid(row=2, column=1, sticky=tk.W)
+
+    self.vision_var = tk.BooleanVar(value=True)
+    self.summary_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(self, text="이미지 Vision AI 분석", variable=self.vision_var, style="TCheckbutton").grid(
+        row=3, column=1, sticky=tk.W, pady=4
+    )
+    ttk.Checkbutton(self, text="페이지별 LLM 요약 생성", variable=self.summary_var, style="TCheckbutton").grid(
+        row=4, column=1, sticky=tk.W, pady=4
+    )
+
+    ttk.Label(self, text="출력 폴더:", style="TLabel").grid(row=5, column=0, sticky=tk.W, pady=8)
+    self.out_var = tk.StringVar(value="./confluence_output")
+    frm = ttk.Frame(self, style="Card.TFrame")
+    frm.grid(row=5, column=1, columnspan=2, sticky=tk.EW)
+    ttk.Entry(frm, textvariable=self.out_var, width=50, style="TEntry").pack(side=tk.LEFT)
+    ttk.Button(frm, text="찾아보기", command=self._browse, style="TButton").pack(side=tk.LEFT, padx=8)
+
+    self.btn = ttk.Button(self, text="▶ 수집 시작", command=self._run, style="TButton")
+    self.btn.grid(row=6, column=0, pady=12)
+
+    self.prog = ttk.Progressbar(self, mode="indeterminate", style="TProgressbar", length=700)
+    self.prog.grid(row=7, column=0, columnspan=3, sticky=tk.EW)
+
+    ttk.Label(self, text="로그:", style="Title.TLabel").grid(row=8, column=0, sticky=tk.W, pady=8)
+    lf = ttk.Frame(self, style="Card.TFrame")
+    lf.grid(row=9, column=0, columnspan=3, sticky=tk.NSEW)
+
+    self.columnconfigure(1, weight=1)
+    self.rowconfigure(9, weight=1)
+
+    sb = ttk.Scrollbar(lf, style="TScrollbar")
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    self.log_box = tk.Text(lf, height=16, yscrollcommand=sb.set, wrap=tk.WORD, bg=CARD, fg=TEXT, font=("SF Pro Display", 9))
+    self.log_box.pack(fill=tk.BOTH, expand=True)
+    sb.config(command=self.log_box.yview)
+
+def _on_url(self, *_):
+    pid = extract_page_id_from_url(self.url_var.get())
+    if pid:
+        self.pid_lbl.config(text=f"페이지 ID: {pid}", foreground="green")
+    else:
+        self.pid_lbl.config(text="페이지 ID: 찾을 수 없음", foreground="red")
+
+def _browse(self):
+    d = filedialog.askdirectory()
+    if d:
+        self.out_var.set(d)
+
+def log(self, msg):
+    def _append():
+        try:
+            self.log_box.insert(tk.END, msg + "\n")
+            self.log_box.see(tk.END)
+        except Exception:
+            pass
+
+    self.after(0, _append)
+
+def _run(self):
+    pid = extract_page_id_from_url(self.url_var.get())
+    if not pid:
+        messagebox.showerror("오류", "URL에서 페이지 ID를 찾을 수 없습니다.")
+        return
+
+    self.btn.config(state="disabled")
+    self.prog.start()
+    threading.Thread(target=self._worker, args=(pid,), daemon=True).start()
+
+def _worker(self, page_id):
+    from playwright.sync_api import sync_playwright
+
+    save_dir = os.path.join(self.out_var.get(), f"page_{page_id}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch_persistent_context(
+                user_data_dir=USER_DATA_DIR,
+                headless=False,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = browser.new_page()
+            page.goto(f"{BASE_URL}/pages/viewpage.action?pageId={page_id}")
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            proceed = {"ok": False}
+            event = threading.Event()
+
+            def ask_login():
+                proceed["ok"] = messagebox.askokcancel(
+                    "로그인 확인",
+                    "Confluence에 로그인되어 있나요?\n[확인] 진행 / [취소] 중단",
+                )
+                event.set()
+
+            self.after(0, ask_login)
+            event.wait()
+
+            if not proceed["ok"]:
+                return
+
+            page.reload(wait_until="networkidle")
+
+            self.log("=" * 50)
+            self.log(f"수집 시작 | 페이지 ID: {page_id}")
+            self.log(f"Vision AI: {self.vision_var.get()} | LLM 요약: {self.summary_var.get()}")
+            self.log("=" * 50)
+
+            process_page(
+                page_session=page,
+                page_id=page_id,
+                save_dir=save_dir,
+                depth=self.depth_var.get(),
+                use_vision=self.vision_var.get(),
+                use_llm_summary=self.summary_var.get(),
+                callback=self.log,
+            )
+
+            self.log("\n✅ 수집 완료!")
+            self.log(f"저장 위치: {os.path.abspath(save_dir)}")
+            self.after(0, lambda: messagebox.showinfo("완료", f"수집 완료!\n{os.path.abspath(save_dir)}"))
+
+    except Exception as e:
+        self.log(f"[오류] {e}\n{traceback.format_exc()}")
+        self.after(0, lambda e=e: messagebox.showerror("오류", str(e)))
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        self.after(0, lambda: (self.prog.stop(), self.btn.config(state="normal")))
+
+─────────────────────────────────────────────
+
+보고서 생성 탭
+
+─────────────────────────────────────────────
+
+class ReportTab(ttk.Frame): def init(self, parent): super().init(parent, style="Card.TFrame", padding=20) self.md_files: List[str] = [] self._build()
+
+def _build(self):
+    ttk.Label(self, text="MD 파일 선택 (여러 개 가능):", style="Title.TLabel").grid(row=0, column=0, sticky=tk.W, pady=8)
+
+    btn_frm = ttk.Frame(self, style="Card.TFrame")
+    btn_frm.grid(row=0, column=1, sticky=tk.W, pady=8)
+    ttk.Button(btn_frm, text="📂 폴더에서 MD 불러오기", command=self._load_folder, style="TButton").pack(side=tk.LEFT, padx=4)
+    ttk.Button(btn_frm, text="📄 파일 직접 선택", command=self._load_files, style="TButton").pack(side=tk.LEFT, padx=4)
+
+    lf = ttk.LabelFrame(self, text="선택된 파일 목록", style="Card.TFrame")
+    lf.grid(row=1, column=0, columnspan=2, sticky=tk.NSEW, pady=10)
+
+    self.columnconfigure(0, weight=1)
+    self.rowconfigure(1, weight=1)
+
+    sb = ttk.Scrollbar(lf, style="TScrollbar")
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    self.file_list = tk.Listbox(
+        lf,
+        selectmode=tk.EXTENDED,
+        height=10,
+        yscrollcommand=sb.set,
+        bg=CARD,
+        fg=TEXT,
+        selectbackground=BLUE_LT,
+        selectforeground=BLUE_DK,
+        font=("SF Pro Display", 10),
+    )
+    self.file_list.pack(fill=tk.BOTH, expand=True)
+    sb.config(command=self.file_list.yview)
+
+    btn_frm2 = ttk.Frame(lf, style="Card.TFrame")
+    btn_frm2.pack(anchor=tk.E, padx=4, pady=4)
+    ttk.Button(btn_frm2, text="선택 항목 제거", command=self._remove_selected, style="TButton").pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frm2, text="📄 Word 로 변환", command=self._export_to_word, style="TButton").pack(side=tk.LEFT, padx=2)
+
+    opt_frm = ttk.LabelFrame(self, text="보고서 옵션", style="Card.TFrame")
+    opt_frm.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=10)
+
+    self.report_title_var = tk.StringVar(value="주간 보고서")
+    ttk.Label(opt_frm, text="보고서 제목:", style="TLabel").grid(row=0, column=0, padx=6, pady=6, sticky=tk.W)
+    ttk.Entry(opt_frm, textvariable=self.report_title_var, width=40, style="TEntry").grid(row=0, column=1, sticky=tk.W)
+
+    self.out_var = tk.StringVar(value="./reports")
+    ttk.Label(opt_frm, text="저장 폴더:", style="TLabel").grid(row=1, column=0, padx=6, pady=6, sticky=tk.W)
+    frm2 = ttk.Frame(opt_frm, style="Card.TFrame")
+    frm2.grid(row=1, column=1, sticky=tk.W)
+    ttk.Entry(frm2, textvariable=self.out_var, width=40, style="TEntry").pack(side=tk.LEFT)
+    ttk.Button(frm2, text="찾아보기", command=lambda: self.out_var.set(filedialog.askdirectory() or self.out_var.get()), style="TButton").pack(side=tk.LEFT, padx=8)
+
+    self.word_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opt_frm, text="Word(.docx) 로 내보내기", variable=self.word_var, style="TCheckbutton").grid(
+        row=2, column=0, columnspan=2, sticky=tk.W, pady=6
+    )
+
+    self.btn = ttk.Button(self, text="📊 보고서 생성 (LLM)", command=self._generate, style="TButton")
+    self.btn.grid(row=3, column=0, pady=12)
+
+    self.prog = ttk.Progressbar(self, mode="indeterminate", style="TProgressbar", length=700)
+    self.prog.grid(row=4, column=0, columnspan=2, sticky=tk.EW)
+
+    ttk.Label(self, text="로그:", style="Title.TLabel").grid(row=5, column=0, sticky=tk.W, pady=8)
+    lf2 = ttk.Frame(self, style="Card.TFrame")
+    lf2.grid(row=6, column=0, columnspan=2, sticky=tk.NSEW, pady=8)
+    self.rowconfigure(6, weight=1)
+
+    sb2 = ttk.Scrollbar(lf2, style="TScrollbar")
+    sb2.pack(side=tk.RIGHT, fill=tk.Y)
+
+    self.log_box = tk.Text(lf2, height=10, yscrollcommand=sb2.set, wrap=tk.WORD, bg=CARD, fg=TEXT, font=("SF Pro Display", 9))
+    self.log_box.pack(fill=tk.BOTH, expand=True)
+    sb2.config(command=self.log_box.yview)
+
+def log(self, msg):
+    def _append():
+        try:
+            self.log_box.insert(tk.END, msg + "\n")
+            self.log_box.see(tk.END)
+        except Exception:
+            pass
+
+    self.after(0, _append)
+
+def _load_folder(self):
+    folder = filedialog.askdirectory(title="MD 파일이 있는 폴더 선택")
+    if not folder:
+        return
+
+    count = 0
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f.endswith(".md"):
+                path = os.path.join(root, f)
+                if path not in self.md_files:
+                    self.md_files.append(path)
+                    self.file_list.insert(tk.END, os.path.relpath(path, folder))
+                    count += 1
+
+    self.log(f"✅ {count}개 파일을 로드했습니다.")
+
+def _load_files(self):
+    files = filedialog.askopenfilenames(
+        title="MD 파일 선택",
+        filetypes=[("Markdown files", "*.md"), ("All files", "*.*")],
+    )
+    if not files:
+        return
+
+    count = 0
+    for path in files:
+        if path not in self.md_files:
+            self.md_files.append(path)
+            self.file_list.insert(tk.END, os.path.basename(path))
+            count += 1
+
+    self.log(f"✅ {count}개 파일을 로드했습니다.")
+
+def _remove_selected(self):
+    selected = self.file_list.curselection()
+    if not selected:
+        messagebox.showinfo("알림", "제거할 파일을 선택해주세요.")
+        return
+
+    for i in reversed(selected):
+        self.file_list.delete(i)
+        if i < len(self.md_files):
+            self.md_files.pop(i)
+
+    self.log(f"🗑️ {len(selected)}개 파일을 제거했습니다.")
+
+def _generate(self):
+    if not self.md_files:
+        messagebox.showwarning("경고", "생성할 MD 파일이 없습니다.\n'폴더에서 MD 불러오기' 또는 '파일 직접 선택'을 이용해주세요.")
+        return
+
+    selected_contents = []
+    for path in self.md_files:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            title = os.path.basename(path)
+            if content.startswith("# "):
+                first_line = content.split("\n", 1)[0]
+                title = first_line[2:].strip() or title
+
+            selected_contents.append({"title": title, "content": content})
+        except Exception as e:
+            self.log(f"⚠️ 파일 읽기 실패: {path} - {e}")
+
+    if not selected_contents:
+        messagebox.showerror("오류", "모든 파일 읽기에 실패했습니다.")
+        return
+
+    self.btn.config(state="disabled")
+    self.prog.start()
+    self.log(f"📊 {len(selected_contents)}개 파일을 종합 중...")
+
+    def _worker():
+        try:
+            report = llm_generate_report(selected_contents)
+            self.after(0, lambda: self._save_report(report))
+        except Exception as e:
+            self.after(
+                0,
+                lambda e=e: (
+                    self.log(f"[오류] {e}"),
+                    messagebox.showerror("오류", str(e)),
+                    self.prog.stop(),
+                    self.btn.config(state="normal"),
+                ),
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _export_to_word(self):
+    if not self.md_files:
+        messagebox.showwarning("경고", "변환할 MD 파일이 없습니다.")
+        return
+
+    self.btn.config(state="disabled")
+    self.prog.start()
+    self.log(f"📝 {len(self.md_files)}개 파일을 Word 로 변환 중...")
+
+    def _worker():
+        results = []
+        try:
+            conv = MDConverter()
+            out_dir = self.out_var.get().strip() or "./word_output"
+            os.makedirs(out_dir, exist_ok=True)
+
+            for path in self.md_files:
+                try:
+                    fname = os.path.basename(path).replace(".md", "")
+                    out_path = os.path.join(out_dir, f"{fname}.docx")
+                    conv.convert_file(path, out_path, add_cover=True, callback=self.log)
+                    results.append(out_path)
+                    self.log(f"✅ 변환 완료: {out_path}")
+                except Exception as e:
+                    self.log(f"❌ 변환 실패: {path} - {e}")
+
+            self.after(
+                0,
+                lambda: (
+                    self.prog.stop(),
+                    self.btn.config(state="normal"),
+                    self.log(f"★ Word 변환 완료! {len(results)}개 파일 생성"),
+                    messagebox.showinfo("완료", f"Word 변환 완료!\n{len(results)}개 파일 생성:\n{out_dir}"),
+                ),
+            )
+        except Exception as e:
+            self.after(
+                0,
+                lambda e=e: (
+                    self.log(f"[오류] {e}"),
+                    messagebox.showerror("오류", str(e)),
+                    self.prog.stop(),
+                    self.btn.config(state="normal"),
+                ),
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def _save_report(self, report: str):
+    try:
+        os.makedirs(self.out_var.get(), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        title_safe = clean_filename(self.report_title_var.get().replace(" ", "_"))
+        filename = f"{title_safe}_{timestamp}.md"
+        path = os.path.join(self.out_var.get(), filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {self.report_title_var.get()}\n\n")
+            f.write(f"생성일: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("---\n\n")
+            f.write(report)
+
+        self.log(f"✅ 보고서 생성 완료: {path}")
+
+        if self.word_var.get():
+            docx_path = path.replace(".md", ".docx")
+            conv = MDConverter()
+            conv.convert_file(path, docx_path, add_cover=True, callback=self.log)
+            self.log(f"✅ Word 보고서 생성 완료: {docx_path}")
+
+        self.prog.stop()
+        self.btn.config(state="normal")
+        messagebox.showinfo("완료", f"보고서 생성 완료!\n\n{path}")
+
+    except Exception as e:
+        self.prog.stop()
+        self.btn.config(state="normal")
+        self.log(f"[오류] 보고서 저장 실패: {e}")
+        messagebox.showerror("오류", f"보고서 저장 실패:\n{e}")
+
+─────────────────────────────────────────────
+
+LLM 설정 탭
+
+─────────────────────────────────────────────
+
+class SettingsTab(ttk.Frame): def init(self, parent): super().init(parent, style="Card.TFrame", padding=20) self._build()
+
+def _build(self):
+    self.columnconfigure(1, weight=1)
+
+    ttk.Label(self, text="LLM 연결 설정", style="Title.TLabel").grid(row=0, column=0, columnspan=2, pady=(0, 16), sticky="w")
+
+    ttk.Label(self, text="API Key:", style="TLabel").grid(row=1, column=0, sticky="w", pady=8)
+    key_frm = ttk.Frame(self, style="Card.TFrame")
+    key_frm.grid(row=1, column=1, sticky="ew", pady=8)
+
+    self.llm_key_var = tk.StringVar(value=LLM_API_KEY)
+    self.key_entry = ttk.Entry(key_frm, textvariable=self.llm_key_var, width=55, show="*", style="TEntry")
+    self.key_entry.pack(side="left", fill="x", expand=True)
+
+    self._show_key = False
+
+    def toggle_key():
+        self._show_key = not self._show_key
+        self.key_entry.config(show="" if self._show_key else "*")
+        show_btn.config(text="숨기기" if self._show_key else "보기")
+
+    show_btn = ttk.Button(key_frm, text="보기", width=6, command=toggle_key, style="TButton")
+    show_btn.pack(side="left", padx=6)
+
+    ttk.Label(self, text="Base URL:", style="TLabel").grid(row=2, column=0, sticky="w", pady=8)
+    self.llm_url_var = tk.StringVar(value=LLM_BASE_URL)
+    ttk.Entry(self, textvariable=self.llm_url_var, width=62, style="TEntry").grid(row=2, column=1, sticky="ew", pady=8)
+    ttk.Label(self, text="  예) http://localhost:8000/v1 또는 사내 OpenAI-compatible 서버 주소", style="Muted.TLabel").grid(row=3, column=1, sticky="w")
+
+    ttk.Label(self, text="텍스트 모델명:", style="TLabel").grid(row=4, column=0, sticky="w", pady=8)
+    self.llm_model_var = tk.StringVar(value=LLM_MODEL)
+    ttk.Entry(self, textvariable=self.llm_model_var, width=30, style="TEntry").grid(row=4, column=1, sticky="w", pady=8)
+
+    ttk.Label(self, text="Vision 모델명:", style="TLabel").grid(row=5, column=0, sticky="w", pady=8)
+    self.llm_vision_var = tk.StringVar(value=LLM_VISION_MODEL)
+    ttk.Entry(self, textvariable=self.llm_vision_var, width=30, style="TEntry").grid(row=5, column=1, sticky="w", pady=8)
+
+    ttk.Label(self, text="최대 토큰:", style="TLabel").grid(row=6, column=0, sticky="w", pady=8)
+    self.llm_tokens_var = tk.StringVar(value=str(LLM_MAX_TOKENS))
+    ttk.Entry(self, textvariable=self.llm_tokens_var, width=10, style="TEntry").grid(row=6, column=1, sticky="w", pady=8)
+
+    btn_frm = ttk.Frame(self, style="Card.TFrame")
+    btn_frm.grid(row=7, column=0, columnspan=2, pady=16, sticky="w")
+    ttk.Button(btn_frm, text="💾 설정 저장", command=self._save_settings, style="TButton").pack(side="left", padx=6)
+    ttk.Button(btn_frm, text="🔗 텍스트 연결 테스트", command=self._test_llm, style="TButton").pack(side="left", padx=6)
+    ttk.Button(btn_frm, text="🖼️ Vision 연결 테스트", command=self._test_vision, style="TButton").pack(side="left", padx=6)
+
+    self.settings_status = ttk.Label(self, text="", style="Muted.TLabel")
+    self.settings_status.grid(row=8, column=0, columnspan=2, sticky="w", pady=8)
+
+    ttk.Separator(self, orient="horizontal").grid(row=9, column=0, columnspan=2, sticky="ew", pady=12)
+
+    info = (
+        "📌 설정 방법\n"
+        "1. Base URL에는 OpenAI-compatible 서버 주소를 입력하세요.\n"
+        "2. API Key가 필요 없는 로컬 서버라면 비워도 됩니다.\n"
+        "3. 텍스트 모델명과 Vision 모델명을 서버에서 제공하는 실제 이름으로 입력하세요.\n"
+        "4. Vision 테스트는 간단한 테스트 이미지를 생성해 모델에 보내는 방식입니다."
+    )
+    ttk.Label(self, text=info, style="Muted.TLabel", justify="left").grid(row=10, column=0, columnspan=2, sticky="w")
+
+def _save_settings(self):
+    key = self.llm_key_var.get().strip()
+    url = self.llm_url_var.get().strip().rstrip("/")
+    model = self.llm_model_var.get().strip()
+    vision = self.llm_vision_var.get().strip()
+    tokens = self.llm_tokens_var.get().strip()
+
+    if not url:
+        self.settings_status.config(text="⚠️ Base URL 은 필수입니다.", foreground="red")
+        return
+
+    try:
+        save_llm_config(key, url, model, vision, int(tokens))
+        self.settings_status.config(text=f"✅ 저장 완료 → {CONFIG_FILE}", foreground="green")
+        messagebox.showinfo("완료", "설정이 저장되었습니다.\n다음 실행 시 자동으로 적용됩니다.")
+    except Exception as e:
+        self.settings_status.config(text=f"❌ 저장 실패: {e}", foreground="red")
+
+def _current_client_values(self):
+    key = self.llm_key_var.get().strip()
+    url = self.llm_url_var.get().strip().rstrip("/")
+    model = self.llm_model_var.get().strip()
+    vision = self.llm_vision_var.get().strip()
+    return key, url, model, vision
+
+def _test_llm(self):
+    key, url, model, _vision = self._current_client_values()
+
+    if not url:
+        self.settings_status.config(text="⚠️ Base URL 은 필수입니다.", foreground="red")
+        return
+
+    self.settings_status.config(text="🔄 텍스트 연결 테스트 중...", foreground="blue")
+    self.update_idletasks()
+
+    def _test():
+        try:
+            client = OpenAI(api_key=key if key else "sk-ignored", base_url=url)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "연결 테스트입니다. 한 문장으로 답해주세요."}],
+                max_tokens=100,
+                temperature=0.1,
+            )
+            answer = resp.choices[0].message.content.strip()[:120]
+            self.after(0, lambda: self.settings_status.config(text=f"✅ 텍스트 연결 성공! 응답: {answer}", foreground="green"))
+        except Exception as e:
+            self.after(0, lambda e=e: self.settings_status.config(text=f"❌ 텍스트 연결 실패: {e}", foreground="red"))
+
+    threading.Thread(target=_test, daemon=True).start()
+
+def _make_test_image(self) -> bytes:
+    img = Image.new("RGB", (900, 500), (255, 255, 255))
+    # PIL 기본 폰트 한계가 있으므로 단순한 도형/막대 그래프 테스트 이미지 생성
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((60, 60, 840, 420), outline=(0, 0, 0), width=3)
+    draw.text((80, 80), "Vision Test Chart", fill=(0, 0, 0))
+    draw.rectangle((130, 300, 250, 390), fill=(90, 120, 180))
+    draw.rectangle((330, 220, 450, 390), fill=(90, 120, 180))
+    draw.rectangle((530, 150, 650, 390), fill=(90, 120, 180))
+    draw.text((145, 400), "A", fill=(0, 0, 0))
+    draw.text((345, 400), "B", fill=(0, 0, 0))
+    draw.text((545, 400), "C", fill=(0, 0, 0))
+    draw.text((680, 155), "C is highest", fill=(0, 0, 0))
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+def _test_vision(self):
+    key, url, _model, vision = self._current_client_values()
+
+    if not url:
+        self.settings_status.config(text="⚠️ Base URL 은 필수입니다.", foreground="red")
+        return
+
+    self.settings_status.config(text="🔄 Vision 연결 테스트 중...", foreground="blue")
+    self.update_idletasks()
+
+    def _test():
+        try:
+            test_png = self._make_test_image()
+            mime, fixed, note = prepare_image_for_vision(test_png, "image/png")
+            b64 = base64.b64encode(fixed).decode("ascii")
+
+            client = OpenAI(api_key=key if key else "sk-ignored", base_url=url)
+            resp = client.chat.completions.create(
+                model=vision,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"이 테스트 이미지를 한 문장으로 설명해주세요. 전처리: {note}"},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}},
+                        ],
+                    }
+                ],
+                max_tokens=200,
+                temperature=0.1,
+            )
+            answer = resp.choices[0].message.content.strip()[:160]
+            self.after(0, lambda: self.settings_status.config(text=f"✅ Vision 연결 성공! 응답: {answer}", foreground="green"))
+        except Exception as e:
+            self.after(0, lambda e=e: self.settings_status.config(text=f"❌ Vision 연결 실패: {e}", foreground="red"))
+
+    threading.Thread(target=_test, daemon=True).start()
+
+─────────────────────────────────────────────
+
+실행
+
+─────────────────────────────────────────────
+
+if name == "main": App().mainloop()
