@@ -1,4 +1,4 @@
-﻿
+
 """
 confluence_md_v2_ocr.py
 
@@ -376,11 +376,30 @@ def html_to_markdown(html: str, page_session=None, base_url: str = "") -> str:
         img_desc = None
         if page_session and src:
             try:
-                full_src = urljoin(base_url + "/", src)
-                resp = page_session.request.get(full_src)
-                if resp.status == 200:
-                    img_bytes = resp.body()
-                    content_type = resp.headers.get("content-type", "image/png").split(";")[0].strip().lower()
+                full_src = urljoin(base_url + "/", src) if not src.startswith("http") else src
+                # page.request.get() 은 SSO/HTTPOnly 쿠키를 제대로 전달 못함
+                # → 브라우저 컨텍스트의 fetch() 사용 (모든 쿠키 자동 포함)
+                result = page_session.evaluate("""
+                    async (url) => {
+                        try {
+                            const resp = await fetch(url, {credentials: 'include'});
+                            if (!resp.ok) return {status: resp.status, data: null, contentType: ''};
+                            const buf = await resp.arrayBuffer();
+                            const bytes = Array.from(new Uint8Array(buf));
+                            return {
+                                status: resp.status,
+                                data: bytes,
+                                contentType: resp.headers.get('content-type') || ''
+                            };
+                        } catch(e) {
+                            return {status: 0, data: null, contentType: '', error: e.message};
+                        }
+                    }
+                """, full_src)
+
+                if result.get("status") == 200 and result.get("data"):
+                    img_bytes = bytes(result["data"])
+                    content_type = result.get("contentType", "image/png").split(";")[0].strip().lower()
                     if content_type == "image/jpg":
                         content_type = "image/jpeg"
 
@@ -389,9 +408,11 @@ def html_to_markdown(html: str, page_session=None, base_url: str = "") -> str:
                     else:
                         img_desc = f"[이미지 분석 스킵: content-type={content_type}, size={len(img_bytes)} bytes]"
                 else:
-                    img_desc = f"[이미지 다운로드 실패: HTTP {resp.status}]"
+                    status = result.get("status", 0)
+                    err = result.get("error", "")
+                    img_desc = f"[이미지 다운로드 실패: HTTP {status}{(' - ' + err) if err else ''}]"
             except Exception as e:
-                img_desc = f"[이미지 다운로드/OCR 실패: {type(e).__name__}: {e}]"
+                img_desc = f"[이미지 다운로드 실패: {type(e).__name__}: {e}]"
 
         replacement = soup.new_tag("p")
         if img_desc:
