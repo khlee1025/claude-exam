@@ -138,7 +138,7 @@ function makeSourceBanner(pageTitle) {
 }
 
 // ─── MD → children 변환 ───────────────────────────
-function parseMD(md) {
+function parseMD(md, _sourcePath) {
   const children = [];
   const lines    = md.split("\n");
   let i = 0, inCode = false, codeLines = [];
@@ -236,6 +236,14 @@ function parseMD(md) {
       i++; continue;
     }
 
+    // 이미지 임베드 마커
+    const emm = s.match(/^\[EMBED_IMAGE:(.+)\]$/);
+    if (emm) {
+      const imgPara = makeImageParagraph(emm[1], _sourcePath || "");
+      if (imgPara) children.push(imgPara);
+      i++; continue;
+    }
+
     // 일반 문단
     children.push(new Paragraph({ spacing: { before: 60, after: 60 }, children: parseInline(s) }));
     i++;
@@ -329,11 +337,42 @@ function docStyles() {
   };
 }
 
+// ─── 이미지 삽입 ─────────────────────────────────
+function makeImageParagraph(imgPath, basePath) {
+  try {
+    // imgPath: "images/img_001.png" (상대경로)
+    const fullPath = path.isAbsolute(imgPath)
+      ? imgPath
+      : path.join(path.dirname(basePath), imgPath);
+    if (!fs.existsSync(fullPath)) return null;
+
+    const imgData  = fs.readFileSync(fullPath);
+    const ext      = path.extname(fullPath).toLowerCase().replace(".", "");
+    const typeMap  = { jpg: "jpg", jpeg: "jpg", png: "png", gif: "gif", bmp: "bmp", webp: "png" };
+    const imgType  = typeMap[ext] || "png";
+
+    // 원본 크기 추정 없이 최대 폭 기준으로 삽입 (A4 content 폭 기준)
+    const maxW = 500, maxH = 400;
+    return new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 120, after: 120 },
+      children: [new ImageRun({
+        type: imgType,
+        data: imgData,
+        transformation: { width: maxW, height: maxH },
+        altText: { title: "이미지", description: imgPath, name: imgPath },
+      })],
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
 // ─── 소스 로드 (파일 or 폴더) ────────────────────
 function loadSources(src) {
   const stat = fs.statSync(src);
   if (stat.isFile()) {
-    return [{ title: path.basename(src, ".md"), md: fs.readFileSync(src, "utf8") }];
+    return [{ title: path.basename(src, ".md"), md: fs.readFileSync(src, "utf8"), path: src }];
   }
   // 폴더: .md 파일 정렬 로드 (보고서/report 파일 제외)
   return fs.readdirSync(src)
@@ -342,6 +381,7 @@ function loadSources(src) {
     .map(f => ({
       title: f.replace(".md", ""),
       md:    fs.readFileSync(path.join(src, f), "utf8"),
+      path:  path.join(src, f),
     }));
 }
 
@@ -365,7 +405,7 @@ async function main() {
   sources.forEach((s, idx) => {
     if (idx > 0) bodyChildren.push(new Paragraph({ children: [new PageBreak()] }));
     if (sources.length > 1) bodyChildren.push(makeSourceBanner(s.title));
-    bodyChildren.push(...parseMD(s.md));
+    bodyChildren.push(...parseMD(s.md, s.path));
   });
 
   const doc = new Document({
