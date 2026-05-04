@@ -10,7 +10,7 @@ const {
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
   Header, Footer, AlignmentType, HeadingLevel, BorderStyle, WidthType,
   ShadingType, VerticalAlign, PageNumber, PageBreak, TableOfContents,
-  LevelFormat,
+  LevelFormat, ImageRun,
 } = require("docx");
 
 // ─── 색상 ──────────────────────────────────────────
