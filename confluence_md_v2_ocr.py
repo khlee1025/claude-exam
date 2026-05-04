@@ -247,14 +247,41 @@ def llm_summarize_image_ocr(ocr_text: str, context: str = "") -> str:
 
 def llm_analyze_image(image_bytes: bytes, context: str = "", mime_type: str = "image/png") -> str:
     """
-    Non-VL Qwen path:
-      image bytes -> OCR text -> Qwen text interpretation
+    Vision API path:
+      image bytes -> base64 -> Qwen Vision direct analysis
     """
     try:
-        ocr_text = extract_text_from_image(image_bytes)
-        return llm_summarize_image_ocr(ocr_text, context=context)
+        b64 = base64.b64encode(image_bytes).decode()
+        data_url = f"data:{mime_type};base64,{b64}"
+        resp = _llm().chat.completions.create(
+            model=LLM_VISION_MODEL,
+            temperature=0.2,
+            max_tokens=min(1000, LLM_MAX_TOKENS),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "당신은 기업 문서의 이미지, 표, 차트, 화면 캡처를 분석하는 전문가입니다.\n"
+                                f"이미지 참고 정보: {context or '없음'}\n\n"
+                                "이 이미지를 업무 보고서 관점에서 분석해주세요. "
+                                "수치, 날짜, 상태, 이슈, 리스크가 있으면 명확히 정리하고, "
+                                "핵심 내용을 3~5문장으로 한국어로 요약해주세요."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                }
+            ],
+        )
+        return resp.choices[0].message.content
     except Exception as e:
-        return f"[이미지 분석 실패: {type(e).__name__}: {e}]"
+        return f"[Vision 이미지 분석 실패: {type(e).__name__}: {e}]"
 
 
 def llm_summarize_page(title: str, markdown_text: str) -> str:
